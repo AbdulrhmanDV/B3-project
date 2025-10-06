@@ -32,7 +32,30 @@ class _SignUpState extends State<SignUp> {
                 color: Color(0xFF00695C),fontSize: 25,fontWeight: FontWeight.w600,
               ),),
 
-              SizedBox(height: 50,),
+          Card(
+            elevation: 20,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Padding(
+              padding: EdgeInsets.all(24.0),
+              child: Column(
+                children: [
+                  SizedBox(height: 50,),
+                  Container(
+                    height: 90,
+                    width: 90,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Color(0xFF00695C).withOpacity(0.1),
+                    ),
+                    child: Icon(
+                      Icons.person,
+                      size: 40,
+                      color: Color(0xFF00695C),
+                    ),
+                  ),
+              SizedBox(height: 40),
               TextField(
                 controller:emailController ,
                 decoration: InputDecoration(
@@ -43,7 +66,7 @@ class _SignUpState extends State<SignUp> {
 
 
               ),
-              SizedBox(height: 50,),
+              SizedBox(height: 20,),
               TextField(
                 controller: passwordController,
                 obscureText: true,
@@ -63,7 +86,7 @@ class _SignUpState extends State<SignUp> {
 
 
               ),
-              SizedBox(height: 50,),
+              SizedBox(height: 20,),
               TextField(
                 controller: confirmController,
                 obscureText: true,
@@ -104,8 +127,11 @@ class _SignUpState extends State<SignUp> {
         ),
       ),
 
+    ],
+        ),
 
-
+        ),
+      ),
     );
   }
 }
