@@ -12,20 +12,51 @@ class _LoginScreenState extends State<LoginScreen> {
   TextEditingController emailController = TextEditingController();
   TextEditingController passwordController = TextEditingController();
 
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+
+
       appBar: AppBar(
         title: Text("login", style: TextStyle(fontWeight: FontWeight.bold),),
         centerTitle: true,
         backgroundColor: Color(0xFF00695C),
 
       ),
+
       body: Center(
           child: Padding(
+
               padding: EdgeInsets.symmetric(horizontal: 24.0),
+
               child: Column(
+
                 children: [
+                  SizedBox(height: 50,),
+                Card(
+                elevation: 20,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(30),
+                ),
+                child: Padding(
+                  padding: EdgeInsets.all(24.0),
+                  child: Column(
+                    children: [
+                      SizedBox(height: 50,),
+                      Container(
+                        height: 100,
+                        width: 100,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Color(0xFF00695C).withOpacity(0.2),
+                        ),
+                        child: Icon(
+                          Icons.person,
+                          size: 50,
+                          color: Color(0xFF00695C),
+                        ),
+                      ),
                 Text("Welcome to our App", style: TextStyle(
                 color: Color(0xFF00695C),
                 fontSize: 25,
@@ -59,7 +90,8 @@ class _LoginScreenState extends State<LoginScreen> {
               ),
               SizedBox(height: 50,),
               ElevatedButton(onPressed: () {
-
+                print("email is:${emailController.text}");
+                print("password is:${passwordController.text}");
 
                 /// if u won't use . text it will print the datatype and how it be saved in the storage
               },
@@ -92,7 +124,11 @@ class _LoginScreenState extends State<LoginScreen> {
     ),
     ),
 
+      ],
+              ),
 
+      ),
+    )
     );
     }
 }
