@@ -1,0 +1,2787 @@
+#include "raylib.h"
+#include <string>
+#include <cmath>
+
+using namespace std;
+
+// =====================
+// Data structure & globals
+// =====================
+
+// Visual node for list / stack
+struct VNode {
+    string value;      // Stored value (as string, we parse to int when needed)
+    Vector2 pos;       // Current screen position (world space)
+    Vector2 target;    // Target position for animation
+    bool hover;        // Is mouse hovering over this node?
+    VNode* next;       // Pointer to next node
+
+    Vector2 animStart; // Animation start position
+    float animT;       // Animation interpolation factor [0..1]
+
+    VNode(const string& v) {
+        value = v;
+        pos = { 0, 0 };
+        target = { 20, 0 };
+        hover = false;
+        next = nullptr;
+        animStart = pos;
+        animT = 1.0f;
+    }
+};
+
+// Current "operation mode"
+enum Mode {
+    MODE_BEGIN,
+    MODE_END,
+    MODE_POS,
+    MODE_SET,
+    MODE_DEL_VAL,
+    MODE_DEL_BEGIN,
+    MODE_DEL_END,
+    MODE_SEARCH,
+    MODE_REVERSE,
+    MODE_MINMAX,
+    MODE_CLEAR,
+    MODE_STACK_PEEK,
+    MODE_BUBBLE_SORT     // *** Bubble sort mode ***
+};
+
+// Type of stored value
+enum ValueType {
+    VALUE_INT,
+    VALUE_STRING
+};
+
+// UI theme
+enum Theme {
+    THEME_LIGHT,
+    THEME_DARK
+};
+
+// Which structure are we visualizing?
+enum StructureType {
+    STRUCT_LIST,
+    STRUCT_STACK
+};
+
+// Search highlight flags
+static bool gHasSearchHighlight = false;
+static string gSearchValue;
+
+static bool gHasMinMaxHighlight = false;
+static int gMinValue = 0;
+static int gMaxValue = 0;
+
+static ValueType gValueType = VALUE_STRING;
+static Theme gTheme = THEME_LIGHT;
+static StructureType gStructure = STRUCT_LIST;
+
+// Step-by-step traversal mode
+static bool gStepMode = false;
+static bool gStepAdvanceRequested = false;
+
+// Operation note (text panel on the right)
+static string gOpTitle;
+static string gOpBody;
+
+static bool gTopMenuExpanded = false;
+
+// Time complexity panel text
+static string gTCOperation = "Insert at BEGINNING";
+static string gTCBest = "O(1)";
+static string gTCAvg = "O(1)";
+static string gTCWorst = "O(1)";
+
+// =====================
+// Traversal state (SEARCH / DELETE BY VALUE / SET / POS)
+// =====================
+struct TraversalState {
+    bool active;
+    Mode mode;
+    string targetValue;
+    string pendingNewValue;
+    VNode* current;
+    VNode* previous;
+    float stepTimer;
+};
+
+static TraversalState gTraversal = { false, MODE_BEGIN, "", "", nullptr, nullptr, 0.0f };
+
+// =====================
+// Bubble sort state (NEW)
+// =====================
+//
+// هذا ال struct يمسك حالة الـ bubble sort أثناء الـ animation
+// نستخدم prev / curr / lastSorted مثل الكود الكلاسيكي للـ bubble sort
+//
+struct BubbleSortState {
+    bool   active;        // هل البابل شغال الآن؟
+    VNode* prev;          // pointer قبل curr
+    VNode* curr;          // العنصر الحالي في المقارنة
+    VNode* lastSorted;    // نهاية الجزء المترتّب (tail)
+    bool   swappedInPass; // هل صار أي swap في الـ pass الحالي؟
+    float  stepTimer;     // مؤقت للـ auto mode
+};
+
+static BubbleSortState gBubble = { false, nullptr, nullptr, nullptr, false, 0.0f };
+
+// =====================
+// Helpers
+// =====================
+
+static void SetOperationNote(const string& title, const string& body) {
+    gOpTitle = title;
+    gOpBody = body;
+}
+
+// Linear interpolation between two Vector2 values
+static Vector2 LerpVec2(Vector2 a, Vector2 b, float t) {
+    return { a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t };
+}
+
+// Try to parse a string to int (with some bounds)
+static bool TryParseInt(const string& s, int& out) {
+    if (s.empty()) return false;
+    long long sign = 1;
+    size_t i = 0;
+    if (s[0] == '-') {
+        sign = -1;
+        i = 1;
+        if (s.size() == 1) return false;
+    }
+    long long v = 0;
+    for (; i < s.size(); i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        v = v * 10 + (s[i] - '0');
+        if (v > 100000000) return false;
+    }
+    v *= sign;
+    if (v < -1000000 || v > 1000000) return false;
+    out = (int)v;
+    return true;
+}
+
+// Keyboard text input handler
+// numericMode = true -> only 0..9 and optional leading '-'
+static void UpdateInput(string& buf, bool& submitted, bool numericMode) {
+    submitted = false;
+    int key = GetCharPressed();
+    while (key > 0) {
+        if (numericMode) {
+            bool isAsciiDigit = (key >= '0' && key <= '9');
+            if (isAsciiDigit) {
+                if (buf.size() < 10) buf.push_back((char)key);
+            }
+            else if (key == '-' && buf.empty()) {
+                buf.push_back('-');
+            }
+        }
+        else {
+            // Printable ASCII characters only
+            if (key >= 32 && key <= 126 && key != '\r' && key != '\n') {
+                if (buf.size() < 20) buf.push_back((char)key);
+            }
+        }
+        key = GetCharPressed();
+    }
+    // ENTER: submit if not empty
+    if (IsKeyPressed(KEY_ENTER) && !buf.empty())
+        submitted = true;
+    // BACKSPACE: remove last character
+    if (IsKeyPressed(KEY_BACKSPACE)) {
+        if (!buf.empty()) buf.pop_back();
+    }
+    // DELETE: clear whole buffer
+    if (IsKeyPressed(KEY_DELETE))
+        buf.clear();
+}
+
+// Compare two values according to current type mode
+static bool ValueEquals(const string& a, const string& b) {
+    if (gValueType == VALUE_STRING) return a == b;
+    int ia, ib;
+    if (!TryParseInt(a, ia)) return false;
+    if (!TryParseInt(b, ib)) return false;
+    return ia == ib;
+}
+
+// =====================
+// Drawing helpers
+// =====================
+
+// Background with gradients and grid (supports light/dark theme)
+static void DrawNiceBackground() {
+    int W = GetScreenWidth();
+    int H = GetScreenHeight();
+
+    if (gTheme == THEME_LIGHT) {
+        Color top = Color{ 245, 247, 255, 255 };
+        Color bottom = Color{ 230, 232, 250, 255 };
+        DrawRectangleGradientV(0, 0, W, H, top, bottom);
+        DrawRectangleGradientH(0, 0, W, H, Color{ 240, 244, 255, 40 }, Color{ 220, 226, 250, 0 });
+
+        Color grid = Color{ 40, 40, 80, 12 };
+        int step = 48;
+        for (int x = 0; x < W; x += step) DrawLine(x, 0, x, H, grid);
+        for (int y = 0; y < H; y += step) DrawLine(0, y, W, y, grid);
+
+        int cx = W / 2;
+        int cy = (int)(H * 0.55f);
+        DrawCircleGradient(cx, cy, (float)(H * 0.55f), Color{ 255, 255, 255, 70 }, Color{ 255, 255, 255, 0 });
+
+        DrawRectangleGradientH(0, 0, 80, H, Color{ 225, 232, 244, 255 }, Color{ 245, 247, 255, 0 });
+        DrawRectangleGradientH(W - 80, 0, 80, H, Color{ 245, 247, 255, 0 }, Color{ 225, 232, 244, 255 });
+    }
+    else {
+        Color top = Color{ 20, 22, 40, 255 };
+        Color bottom = Color{ 10, 12, 25, 255 };
+        DrawRectangleGradientV(0, 0, W, H, top, bottom);
+        DrawRectangleGradientH(0, 0, W, H, Color{ 40, 35, 70, 60 }, Color{ 10, 10, 25, 0 });
+
+        Color grid = Color{ 150, 150, 220, 18 };
+        int step = 48;
+        for (int x = 0; x < W; x += step) DrawLine(x, 0, x, H, grid);
+        for (int y = 0; y < H; y += step) DrawLine(0, y, W, y, grid);
+
+        int cx = W / 2;
+        int cy = (int)(H * 0.55f);
+        DrawCircleGradient(cx, cy, (float)(H * 0.55f), Color{ 80, 60, 140, 80 }, Color{ 10, 10, 25, 0 });
+
+        DrawRectangleGradientH(0, 0, 80, H, Color{ 25, 25, 50, 200 }, Color{ 10, 10, 30, 0 });
+        DrawRectangleGradientH(W - 80, 0, 80, H, Color{ 10, 10, 30, 0 }, Color{ 25, 25, 50, 200 });
+    }
+}
+
+// Status message at bottom of screen
+static void ShowStatus(Font font, const string& msg) {
+    if (msg.empty()) return;
+    int W = GetScreenWidth();
+    int H = GetScreenHeight();
+    float size = 20.0f;
+    Vector2 textSize = MeasureTextEx(font, msg.c_str(), size, 1);
+    float boxW = textSize.x + 40.0f;
+    float boxH = 44.0f;
+    float x = (float)W / 2 - boxW / 2;
+    float y = (float)H - boxH - 18.0f;
+
+    Color shadow = Color{ 0, 0, 0, 40 };
+    Color fill = (gTheme == THEME_LIGHT) ? Color{ 35, 45, 75, 230 } : Color{ 18, 20, 35, 235 };
+
+    DrawRectangleRounded(Rectangle{ x + 3, y + 4, boxW, boxH }, 0.24f, 10, shadow);
+    DrawRectangleRounded(Rectangle{ x, y, boxW, boxH }, 0.24f, 10, fill);
+    DrawRectangleRoundedLines(Rectangle{ x, y, boxW, boxH }, 0.24f, 10, Color{ 255, 255, 255, 20 });
+
+    DrawTextEx(font, msg.c_str(),
+        Vector2{ (float)W / 2 - textSize.x / 2, y + (boxH - textSize.y) / 2 },
+        size, 1, Color{ 255, 255, 255, 255 });
+}
+
+// Input box centered on screen
+static void DrawCenteredInputBox(
+    Font font,
+    string& buf,
+    float boxY,
+    Mode mode,
+    bool awaitingSecondInput
+) {
+    int W = GetScreenWidth();
+    const float boxW = 480.0f;
+    const float boxH = 64.0f;
+    float x = (W - boxW) / 2.0f;
+    Rectangle r = { x, boxY, boxW, boxH };
+
+    Color shadow = Color{ 0, 0, 0, 26 };
+    Color fill = (gTheme == THEME_LIGHT) ? Color{ 255, 255, 255, 245 } : Color{ 30, 32, 50, 245 };
+    Color border = (gTheme == THEME_LIGHT) ? Color{ 170, 70, 200, 220 } : Color{ 189, 120, 240, 235 };
+    Color textColor = (gTheme == THEME_LIGHT) ? Color{ 18, 24, 31, 255 } : Color{ 235, 238, 255, 255 };
+
+    DrawRectangleRounded(Rectangle{ r.x + 4, r.y + 6, r.width, r.height }, 0.18f, 10, shadow);
+    DrawRectangleRounded(r, 0.18f, 10, fill);
+    DrawRectangleRoundedLines(r, 0.18f, 10, border);
+
+    string mainLabel;
+
+    if (gStructure == STRUCT_STACK) {
+        // Input labels for stack
+        if (mode == MODE_BEGIN) mainLabel = "VALUE -> ENTER : PUSH (add to TOP)";
+        else if (mode == MODE_SEARCH) mainLabel = "VALUE -> ENTER : SEARCH in STACK";
+        else if (mode == MODE_DEL_BEGIN) mainLabel = "Click button: POP (remove TOP)";
+        else if (mode == MODE_STACK_PEEK) mainLabel = "Click button: PEEK (show TOP)";
+        else if (mode == MODE_CLEAR) mainLabel = "Click button: CLEAR STACK";
+        else mainLabel = "Stack operation";
+    }
+    else {
+        // Input labels for list
+        if (mode == MODE_BEGIN) mainLabel = "VALUE -> ENTER : Insert at BEGINNING";
+        else if (mode == MODE_END) mainLabel = "VALUE -> ENTER : Insert at END";
+        else if (mode == MODE_POS) {
+            if (!awaitingSecondInput) mainLabel = "Step 1: NEW VALUE -> ENTER";
+            else mainLabel = "Step 2: AFTER VALUE (existing node) -> ENTER";
+        }
+        else if (mode == MODE_SET) {
+            if (!awaitingSecondInput) mainLabel = "Step 1: TARGET VALUE (existing) -> ENTER";
+            else mainLabel = "Step 2: NEW VALUE -> ENTER";
+        }
+        else if (mode == MODE_DEL_VAL) mainLabel = "VALUE -> ENTER : Delete by VALUE (step)";
+        else if (mode == MODE_SEARCH) mainLabel = "VALUE -> ENTER : SEARCH & highlight";
+        else if (mode == MODE_DEL_BEGIN) mainLabel = "Click button: Delete from BEGINNING";
+        else if (mode == MODE_DEL_END) mainLabel = "Click button: Delete from END";
+        else if (mode == MODE_REVERSE) mainLabel = "Click button: Reverse the list";
+        else if (mode == MODE_MINMAX) mainLabel = "Click button: Min/Max highlight (INT only)";
+        else if (mode == MODE_CLEAR) mainLabel = "Click button: CLEAR the whole list";
+        else if (mode == MODE_BUBBLE_SORT) mainLabel = "Click menu: BUBBLE SORT (INT list)";
+    }
+
+    string typeLabel = string("Current type: ") +
+        (gValueType == VALUE_INT ? "INT" : "STRING");
+
+    float labelSize = 18;
+    Vector2 mainLabelSize = MeasureTextEx(font, mainLabel.c_str(), labelSize, 1);
+    Vector2 typeLabelSize = MeasureTextEx(font, typeLabel.c_str(), labelSize, 1);
+    float mainY = boxY - 60.0f;
+    float typeY = boxY - 34.0f;
+
+    Color labelColor = (gTheme == THEME_LIGHT) ? Color{ 60, 70, 100, 230 } : Color{ 210, 215, 245, 230 };
+    Color typeColor = (gTheme == THEME_LIGHT) ? Color{ 110, 90, 170, 230 } : Color{ 190, 160, 255, 230 };
+
+    DrawTextEx(font, mainLabel.c_str(),
+        Vector2{ (float)W / 2 - mainLabelSize.x / 2, mainY },
+        labelSize, 1, labelColor);
+
+    DrawTextEx(font, typeLabel.c_str(),
+        Vector2{ (float)W / 2 - typeLabelSize.x / 2, typeY },
+        labelSize, 1, typeColor);
+
+    // Draw input text
+    float fontSize = 30;
+    Vector2 textPos = { x + 18, boxY + 16 };
+    DrawTextEx(font, buf.c_str(), textPos, fontSize, 1, textColor);
+
+    // Blinking caret
+    double t = GetTime();
+    int phase = (int)(t * 2.0);
+    bool showCaret = (phase % 2) == 0;
+
+    if (showCaret) {
+        Vector2 currentTextSize = MeasureTextEx(font, buf.c_str(), fontSize, 1.0f);
+        float cx = textPos.x + currentTextSize.x + 3;
+        Color caretColor = (gTheme == THEME_LIGHT) ? Color{ 18, 24, 31, 170 } : Color{ 230, 235, 255, 210 };
+        DrawLine((int)cx, (int)(boxY + 10), (int)cx, (int)(boxY + boxH - 10), caretColor);
+    }
+}
+
+// Mode badge at top (shows current operation)
+static void DrawModeBadge(Font font, Mode mode) {
+    string modeLabel = "Mode: ";
+
+    if (gStructure == STRUCT_STACK) {
+        switch (mode) {
+        case MODE_BEGIN:       modeLabel += "PUSH (add to TOP)"; break;
+        case MODE_DEL_BEGIN:   modeLabel += "POP (remove TOP)"; break;
+        case MODE_STACK_PEEK:  modeLabel += "PEEK (show TOP)"; break;
+        case MODE_SEARCH:      modeLabel += "SEARCH in STACK"; break;
+        case MODE_CLEAR:       modeLabel += "CLEAR STACK"; break;
+        default:               modeLabel += "Stack"; break;
+        }
+    }
+    else {
+        switch (mode) {
+        case MODE_BEGIN:      modeLabel += "Insert at BEGINNING"; break;
+        case MODE_END:        modeLabel += "Insert at END"; break;
+        case MODE_POS:        modeLabel += "Insert AFTER VALUE"; break;
+        case MODE_SET:        modeLabel += "SET node VALUE"; break;
+        case MODE_DEL_VAL:    modeLabel += "Delete by VALUE"; break;
+        case MODE_DEL_BEGIN:  modeLabel += "Delete from BEGINNING"; break;
+        case MODE_DEL_END:    modeLabel += "Delete from END"; break;
+        case MODE_SEARCH:     modeLabel += "SEARCH VALUE"; break;
+        case MODE_REVERSE:    modeLabel += "REVERSE LIST"; break;
+        case MODE_MINMAX:     modeLabel += "MIN/MAX highlight"; break;
+        case MODE_CLEAR:      modeLabel += "CLEAR LIST"; break;
+        case MODE_BUBBLE_SORT:modeLabel += "BUBBLE SORT"; break;
+        case MODE_STACK_PEEK: modeLabel += "PEEK"; break; // not used for list
+        }
+    }
+
+    float badgeFont = 18;
+    Vector2 modeLabelSize = MeasureTextEx(font, modeLabel.c_str(), badgeFont, 1);
+    float bx = (float)GetScreenWidth() / 2 - modeLabelSize.x / 2;
+    float by = 52.0f;
+
+    Rectangle badge = { bx - 16, by - 6, modeLabelSize.x + 32, modeLabelSize.y + 12 };
+    Color fill = (gTheme == THEME_LIGHT) ? Color{ 255, 255, 255, 240 } : Color{ 35, 38, 60, 240 };
+    Color border = (gTheme == THEME_LIGHT) ? Color{ 210, 215, 230, 255 } : Color{ 110, 115, 160, 255 };
+    Color textColor = (gTheme == THEME_LIGHT) ? Color{ 70, 80, 110, 255 } : Color{ 230, 235, 255, 255 };
+
+    DrawRectangleRounded(badge, 0.40f, 10, fill);
+    DrawRectangleRoundedLines(badge, 0.40f, 10, border);
+
+    DrawTextEx(font, modeLabel.c_str(),
+        Vector2{ bx, by },
+        badgeFont, 1, textColor);
+}
+
+// Toggle for INT / STRING type
+static Rectangle DrawTypeToggle(Font font) {
+    string label = string("TYPE: ") + (gValueType == VALUE_INT ? "INT" : "STRING");
+    float fs = 18.0f;
+    Vector2 labelTextSize = MeasureTextEx(font, label.c_str(), fs, 1);
+
+    float w = labelTextSize.x + 24.0f;
+    float h = labelTextSize.y + 10.0f;
+    float x = (float)GetScreenWidth() - w - 30.0f;
+    float y = 20.0f;
+
+    Rectangle r = { x, y, w, h };
+
+    Color fill;
+    if (gValueType == VALUE_INT) fill = Color{ 130, 100, 240, 255 };
+    else fill = Color{ 70, 190, 210, 255 };
+    if (gTheme == THEME_DARK) {
+        fill = (gValueType == VALUE_INT) ? Color{ 140, 110, 250, 255 } : Color{ 60, 180, 200, 255 };
+    }
+    Color border = Color{ 40, 45, 80, 255 };
+
+    DrawRectangleRounded(Rectangle{ r.x + 2, r.y + 3, r.width, r.height }, 0.5f, 10, Color{ 0, 0, 0, 30 });
+    DrawRectangleRounded(r, 0.5f, 10, fill);
+    DrawRectangleRoundedLines(r, 0.5f, 10, border);
+
+    Vector2 txtPos = { r.x + (r.width - labelTextSize.x) / 2.0f,
+                       r.y + (r.height - labelTextSize.y) / 2.0f };
+    DrawTextEx(font, label.c_str(), txtPos, fs, 1, Color{ 255, 255, 255, 255 });
+
+    return r;
+}
+
+// Toggle for theme (light / dark)
+static Rectangle DrawThemeToggle(Font font) {
+    string label = string("Theme: ") + (gTheme == THEME_LIGHT ? "Light" : "Dark");
+    float fs = 18.0f;
+    Vector2 labelTextSize = MeasureTextEx(font, label.c_str(), fs, 1);
+
+    float w = labelTextSize.x + 24.0f;
+    float h = labelTextSize.y + 10.0f;
+    float x = 30.0f;
+    float y = 20.0f;
+
+    Rectangle r = { x, y, w, h };
+
+    Color fill = (gTheme == THEME_LIGHT) ? Color{ 245, 246, 255, 240 } : Color{ 55, 60, 90, 240 };
+    Color border = (gTheme == THEME_LIGHT) ? Color{ 185, 190, 225, 255 } : Color{ 130, 135, 190, 255 };
+    Color textCol = (gTheme == THEME_LIGHT) ? Color{ 45, 55, 90, 255 } : Color{ 230, 235, 255, 255 };
+
+    DrawRectangleRounded(Rectangle{ r.x + 2, r.y + 3, r.width, r.height }, 0.5f, 10, Color{ 0, 0, 0, 26 });
+    DrawRectangleRounded(r, 0.5f, 10, fill);
+    DrawRectangleRoundedLines(r, 0.5f, 10, border);
+
+    Vector2 pos = { r.x + (r.width - labelTextSize.x) / 2.0f,
+                    r.y + (r.height - labelTextSize.y) / 2.0f };
+    DrawTextEx(font, label.c_str(), pos, fs, 1, textCol);
+
+    return r;
+}
+
+// Toggle for structure (LIST / STACK)
+static Rectangle DrawStructureToggle(Font font) {
+    string label = string("Structure: ") +
+        (gStructure == STRUCT_LIST ? "LIST" : "STACK");
+    float fs = 18.0f;
+    Vector2 labelTextSize = MeasureTextEx(font, label.c_str(), fs, 1);
+
+    float w = labelTextSize.x + 24.0f;
+    float h = labelTextSize.y + 10.0f;
+    float x = 30.0f;
+    float y = 60.0f;
+
+    Rectangle r = { x, y, w, h };
+
+    Color fill = (gTheme == THEME_LIGHT) ? Color{ 245, 246, 255, 240 } : Color{ 55, 60, 90, 240 };
+    Color border = (gTheme == THEME_LIGHT) ? Color{ 185, 190, 225, 255 } : Color{ 130, 135, 190, 255 };
+    Color textCol = (gTheme == THEME_LIGHT) ? Color{ 45, 55, 90, 255 } : Color{ 230, 235, 255, 255 };
+
+    DrawRectangleRounded(Rectangle{ r.x + 2, r.y + 3, r.width, r.height }, 0.5f, 10, Color{ 0, 0, 0, 26 });
+    DrawRectangleRounded(r, 0.5f, 10, fill);
+    DrawRectangleRoundedLines(r, 0.5f, 10, border);
+
+    Vector2 pos = { r.x + (r.width - labelTextSize.x) / 2.0f,
+                    r.y + (r.height - labelTextSize.y) / 2.0f };
+    DrawTextEx(font, label.c_str(), pos, fs, 1, textCol);
+
+    return r;
+}
+
+// Toggle for step-by-step mode
+static Rectangle DrawStepToggle(Font font) {
+    string label = string("Step mode: ") + (gStepMode ? "ON" : "OFF");
+    float fs = 16.0f;
+    Vector2 labelTextSize = MeasureTextEx(font, label.c_str(), fs, 1);
+
+    float w = labelTextSize.x + 26.0f;
+    float h = labelTextSize.y + 8.0f;
+    float x = (float)GetScreenWidth() - w - 30.0f;
+    float y = 60.0f;
+
+    Rectangle r = { x, y, w, h };
+
+    Color fillOn = (gTheme == THEME_LIGHT) ? Color{ 200, 230, 255, 255 } : Color{ 80, 110, 150, 255 };
+    Color fillOff = (gTheme == THEME_LIGHT) ? Color{ 235, 240, 250, 255 } : Color{ 55, 65, 100, 255 };
+    Color fill = gStepMode ? fillOn : fillOff;
+    Color border = (gTheme == THEME_LIGHT) ? Color{ 180, 190, 225, 255 } : Color{ 120, 130, 180, 255 };
+    Color textCol = (gTheme == THEME_LIGHT) ? Color{ 60, 70, 110, 255 } : Color{ 230, 235, 255, 255 };
+
+    DrawRectangleRounded(Rectangle{ r.x + 2, r.y + 3, r.width, r.height }, 0.5f, 10, Color{ 0, 0, 0, 18 });
+    DrawRectangleRounded(r, 0.5f, 10, fill);
+    DrawRectangleRoundedLines(r, 0.5f, 10, border);
+
+    Vector2 pos = { r.x + (r.width - labelTextSize.x) / 2.0f,
+                    r.y + (r.height - labelTextSize.y) / 2.0f };
+    DrawTextEx(font, label.c_str(), pos, fs, 1, textCol);
+
+    return r;
+}
+
+// Legend panel explaining colors
+static void DrawLegend(Font font) {
+    float W = (float)GetScreenWidth();
+
+    float panelWidth = 320.0f;
+    float panelHeight = 280.0f;
+    float x = W - panelWidth - 30.0f;
+    float y = 110.0f;
+
+    Rectangle shadow = { x + 5, y + 7, panelWidth, panelHeight };
+    DrawRectangleRounded(shadow, 0.20f, 12, Color{ 0, 0, 0, 22 });
+
+    Color panelFill = (gTheme == THEME_LIGHT) ? Color{ 255, 255, 255, 240 } : Color{ 32, 35, 55, 240 };
+    Color panelBorder = (gTheme == THEME_LIGHT) ? Color{ 215, 220, 235, 255 } : Color{ 110, 115, 160, 255 };
+    Color titleColor = (gTheme == THEME_LIGHT) ? Color{ 50, 60, 85, 255 } : Color{ 220, 225, 255, 255 };
+    Color textColor = (gTheme == THEME_LIGHT) ? Color{ 60, 70, 90, 255 } : Color{ 215, 220, 245, 255 };
+
+    Rectangle panel = { x, y, panelWidth, panelHeight };
+    DrawRectangleRounded(panel, 0.20f, 12, panelFill);
+    DrawRectangleRoundedLines(panel, 0.20f, 12, panelBorder);
+
+    DrawTextEx(font, "Colors", Vector2{ x + 20, y + 12 }, 24, 1, titleColor);
+
+    float rowY = y + 56;
+    float rowH = 40;
+
+    struct Row {
+        Color c;
+        const char* label;
+    } rows[] = {
+        { Color{ 92, 130, 255, 255 },    "Normal node" },
+        { Color{ 126, 160, 255, 255 },   "Hover" },
+        { Color{ 82, 196, 218, 255 },    "Search match / current" },
+        { Color{ 222, 120, 190, 255 },   "Min value (INT)" },
+        { Color{ 160, 95, 255, 255 },    "Max value (INT)" },
+    };
+
+    for (auto& rRow : rows) {
+        Rectangle colorBox = { x + 24, rowY + 4, 28, 28 };
+        DrawRectangleRounded(colorBox, 0.45f, 6, rRow.c);
+        DrawRectangleRoundedLines(colorBox, 0.45f, 6, Color{ 30, 30, 40, 80 });
+        DrawTextEx(font, rRow.label, Vector2{ x + 70, rowY + 8 }, 18, 1, textColor);
+        rowY += rowH;
+    }
+}
+
+// Helper: draw word-wrapped text body inside a rectangle
+static void DrawOperationBodyLines(Font font, const string& text, Rectangle area) {
+    float fontSize = 18.0f;
+    float lineSpacing = fontSize + 3.0f;
+    Color color = (gTheme == THEME_LIGHT) ? Color{ 60, 70, 95, 255 } : Color{ 215, 220, 245, 255 };
+
+    float x = area.x;
+    float y = area.y;
+    float maxWidth = area.width;
+    float maxY = area.y + area.height;
+
+    string currentLine;
+    string currentWord;
+
+    auto drawLineIfSpace = [&](const string& lineText) {
+        if (lineText.empty()) return false;
+        if (y > maxY - lineSpacing) return false;
+        DrawTextEx(font, lineText.c_str(), Vector2{ x, y }, fontSize, 1.0f, color);
+        y += lineSpacing;
+        return true;
+        };
+
+    for (size_t i = 0; i <= text.size(); ++i) {
+        char c = (i < text.size()) ? text[i] : ' ';
+        bool isEnd = (i == text.size());
+
+        if (c == '\n') {
+            if (!currentWord.empty()) {
+                string candidate = currentLine.empty() ? currentWord : currentLine + " " + currentWord;
+                Vector2 size = MeasureTextEx(font, candidate.c_str(), fontSize, 1.0f);
+                if (size.x <= maxWidth || currentLine.empty()) currentLine = candidate;
+                else {
+                    if (!drawLineIfSpace(currentLine)) return;
+                    currentLine = currentWord;
+                }
+                currentWord.clear();
+            }
+            if (!drawLineIfSpace(currentLine)) return;
+            currentLine.clear();
+        }
+        else if (c == ' ' || isEnd) {
+            if (!currentWord.empty()) {
+                string candidate = currentLine.empty() ? currentWord : currentLine + " " + currentWord;
+                Vector2 size = MeasureTextEx(font, candidate.c_str(), fontSize, 1.0f);
+                if (size.x <= maxWidth || currentLine.empty()) currentLine = candidate;
+                else {
+                    if (!drawLineIfSpace(currentLine)) return;
+                    currentLine = currentWord;
+                }
+                currentWord.clear();
+            }
+            if (isEnd) {
+                if (!currentLine.empty()) drawLineIfSpace(currentLine);
+            }
+        }
+        else {
+            currentWord.push_back(c);
+        }
+    }
+}
+
+// Operation note panel on the right
+static void DrawOperationNote(Font font) {
+    if (gOpTitle.empty() && gOpBody.empty()) return;
+
+    float W = (float)GetScreenWidth();
+    float panelWidth = 360.0f;
+    float panelHeight = 290.0f;
+    float x = W - panelWidth - 30.0f;
+
+    const float legendTop = 110.0f;
+    const float legendHeight = 280.0f;
+    const float spacing = 24.0f;
+    float y = legendTop + legendHeight + spacing;
+
+    Rectangle shadow = { x + 4, y + 6, panelWidth, panelHeight };
+    DrawRectangleRounded(shadow, 0.18f, 10, Color{ 0, 0, 0, 22 });
+
+    Color panelFill = (gTheme == THEME_LIGHT) ? Color{ 250, 250, 255, 240 } : Color{ 32, 35, 58, 240 };
+    Color border = (gTheme == THEME_LIGHT) ? Color{ 205, 210, 235, 255 } : Color{ 110, 115, 165, 255 };
+    Color titleColor = (gTheme == THEME_LIGHT) ? Color{ 60, 65, 110, 255 } : Color{ 220, 225, 255, 255 };
+    Color opTitleColor = (gTheme == THEME_LIGHT) ? Color{ 90, 60, 155, 255 } : Color{ 200, 170, 255, 255 };
+
+    Rectangle panel = { x, y, panelWidth, panelHeight };
+    DrawRectangleRounded(panel, 0.18f, 10, panelFill);
+    DrawRectangleRoundedLines(panel, 0.18f, 10, border);
+
+    float titleSize = 20.0f;
+    DrawTextEx(font, "Operation Note", Vector2{ x + 14, y + 8 }, titleSize, 1, titleColor);
+
+    float opTitleSize = 18.0f;
+    DrawTextEx(font, gOpTitle.c_str(), Vector2{ x + 14, y + 34 }, opTitleSize, 1, opTitleColor);
+
+    Rectangle textArea = { x + 14, y + 64, panelWidth - 28.0f, panelHeight - 80.0f };
+    DrawOperationBodyLines(font, gOpBody, textArea);
+}
+
+// Draw an arrow line with triangular head
+static void DrawArrowShape(Vector2 a, Vector2 b, float thickness, float headSize, Color c) {
+    DrawLineEx(a, b, thickness, c);
+    Vector2 dir = { b.x - a.x, b.y - a.y };
+    float len = sqrtf(dir.x * dir.x + dir.y * dir.y);
+    if (len < 0.001f) return;
+    dir.x /= len;
+    dir.y /= len;
+    Vector2 left = { -dir.y, dir.x };
+    Vector2 p1 = b;
+    Vector2 p2 = { b.x - dir.x * headSize + left.x * (headSize * 0.5f),
+                   b.y - dir.y * headSize + left.y * (headSize * 0.5f) };
+    Vector2 p3 = { b.x - dir.x * headSize - left.x * (headSize * 0.5f),
+                   b.y - dir.y * headSize - left.y * (headSize * 0.5f) };
+    DrawTriangle(p1, p2, p3, c);
+}
+
+// Fancy arrow from HEAD/TOP label to node
+static void DrawHeadArrowNice(Vector2 headTextPos, Vector2 headTextSize, Vector2 nodePos) {
+    Vector2 start = { headTextPos.x + headTextSize.x / 2.0f,
+                      headTextPos.y + headTextSize.y + 6.0f };
+    Vector2 end = { nodePos.x, nodePos.y - 40.0f };
+    Color outer = Color{ 120, 100, 240, 255 };
+    Color inner = Color{ 255, 255, 255, 220 };
+    DrawCircleV(start, 6.0f, outer);
+    DrawArrowShape(start, end, 7.0f, 28.0f, outer);
+    DrawArrowShape(start, end, 3.0f, 18.0f, inner);
+}
+
+// Generic pointer arrow with label (for CURRENT / PREVIOUS pointers)
+static void DrawPointerArrowLabel(
+    Font font,
+    const char* label,
+    Vector2 nodeScreen,
+    float horizontalOffset,
+    float verticalOffset,
+    Color outer,
+    Color inner
+) {
+    float labelFont = 22.0f;
+    Vector2 labelSize = MeasureTextEx(font, label, labelFont, 1);
+    Vector2 labelPos = {
+        nodeScreen.x - labelSize.x / 2.0f + horizontalOffset,
+        nodeScreen.y - verticalOffset
+    };
+
+    DrawTextEx(font, label, labelPos, labelFont, 1, outer);
+
+    Vector2 start = { labelPos.x + labelSize.x / 2.0f,
+                      labelPos.y + labelSize.y + 6.0f };
+    Vector2 end = { nodeScreen.x, nodeScreen.y - 40.0f };
+
+    DrawCircleV(start, 5.0f, outer);
+    DrawArrowShape(start, end, 6.0f, 24.0f, outer);
+    DrawArrowShape(start, end, 3.0f, 16.0f, inner);
+}
+
+// Node rectangle centered at a given position
+static Rectangle NodeRectAt(Vector2 center, float w, float h) {
+    return Rectangle{ center.x - w / 2, center.y - h / 2, w, h };
+}
+
+// Node width depends on text + pointer area
+static float GetNodeWidth(const VNode* n, Font font) {
+    const float baseWidth = 170.0f;
+    const float maxWidth = 340.0f;
+    const float pointerPadding = 80.0f;
+    float fontSize = 26.0f;
+    Vector2 textSize = MeasureTextEx(font, n->value.c_str(), fontSize, 1.0f);
+    float desiredValueWidth = textSize.x + 40.0f;
+    float width = baseWidth;
+    if (desiredValueWidth + pointerPadding > width)
+        width = desiredValueWidth + pointerPadding;
+    if (width > maxWidth)
+        width = maxWidth;
+    return width;
+}
+
+// Draw one node box with value and "next" field, and color states
+static void DrawNodeBox(Font font, const VNode* n) {
+    const float h = 64.0f;
+    const float round = 0.18f;
+    float w = GetNodeWidth(n, font);
+    Rectangle r = NodeRectAt(n->pos, w, h);
+
+    Color fillNormal = Color{ 92, 130, 255, 255 };
+    Color fillHover = Color{ 126, 160, 255, 255 };
+    Color fillSearch = Color{ 82, 196, 218, 255 };
+    Color fillMin = Color{ 222, 120, 190, 255 };
+    Color fillMax = Color{ 160, 95, 255, 255 };
+    Color fillCurrent = Color{ 70, 90, 120, 255 };
+    Color border = Color{ 40, 45, 90, 220 };
+    Color textColor = Color{ 255, 255, 255, 255 };
+
+    bool isSearchMatch = (gHasSearchHighlight && n->value == gSearchValue);
+
+    bool isMin = false;
+    bool isMax = false;
+    if (gHasMinMaxHighlight) {
+        int v;
+        if (TryParseInt(n->value, v)) {
+            if (v == gMinValue) isMin = true;
+            if (v == gMaxValue) isMax = true;
+        }
+    }
+
+    bool isCurrentTraversal = (gTraversal.active && gTraversal.current == n);
+
+    Color fill = fillNormal;
+    if (isCurrentTraversal) fill = fillCurrent;
+    else if (n->hover) fill = fillHover;
+    else {
+        if (isSearchMatch) fill = fillSearch;
+        if (gHasMinMaxHighlight) {
+            if (isMin && isMax) fill = fillMin;
+            else if (isMin) fill = fillMin;
+            else if (isMax) fill = fillMax;
+        }
+    }
+
+    // Shadow
+    Rectangle shadow = r;
+    shadow.x += 4;
+    shadow.y += 5;
+    DrawRectangleRounded(shadow, round, 10, Color{ 0, 0, 0, 35 });
+
+    // Glows
+    if (isSearchMatch) {
+        Rectangle glow = { r.x - 5, r.y - 5, r.width + 10, r.height + 10 };
+        DrawRectangleRoundedLines(glow, round, 12, Color{ 82, 196, 218, 210 });
+    }
+    if (isMax && gHasMinMaxHighlight) {
+        Rectangle glowMax = { r.x - 6, r.y - 6, r.width + 12, r.height + 12 };
+        DrawRectangleRoundedLines(glowMax, round, 12, Color{ 180, 120, 255, 180 });
+    }
+
+    // Node body
+    DrawRectangleRounded(r, round, 10, fill);
+    DrawRectangleRoundedLines(r, round, 10, border);
+
+    // Split between value and pointer area
+    float midX = r.x + r.width * 0.56f;
+    DrawLineEx(Vector2{ midX, r.y }, Vector2{ midX, r.y + r.height }, 2.0f, Color{ 255, 255, 255, 120 });
+
+    // Draw value (auto font-size / truncate)
+    string displayText = n->value;
+    float valueAreaWidth = (midX - r.x) - 16.0f;
+    float maxTextWidth = valueAreaWidth - 8.0f;
+    float fontSize = 26.0f;
+    const float minFontSize = 14.0f;
+    Vector2 textSize = MeasureTextEx(font, displayText.c_str(), fontSize, 1.0f);
+    while (textSize.x > maxTextWidth && fontSize > minFontSize) {
+        fontSize -= 1.0f;
+        textSize = MeasureTextEx(font, displayText.c_str(), fontSize, 1.0f);
+    }
+    if (textSize.x > maxTextWidth) {
+        string ellipsis = "...";
+        string base;
+        for (size_t i = 0; i < n->value.size(); ++i) {
+            string candidate = base + n->value[i] + ellipsis;
+            Vector2 candidateSize = MeasureTextEx(font, candidate.c_str(), fontSize, 1.0f);
+            if (candidateSize.x > maxTextWidth) break;
+            base.push_back(n->value[i]);
+        }
+        displayText = base + ellipsis;
+        textSize = MeasureTextEx(font, displayText.c_str(), fontSize, 1.0f);
+    }
+
+    float valueCenterX = r.x + (midX - r.x) / 2.0f;
+    DrawTextEx(font, displayText.c_str(),
+        Vector2{ valueCenterX - textSize.x / 2.0f, n->pos.y - textSize.y / 2.0f },
+        fontSize, 1, textColor);
+
+    // Pointer box
+    Rectangle ptrBox = { midX + 10, r.y + 12, r.x + r.width - (midX + 20), r.height - 24 };
+    DrawRectangleRounded(ptrBox, 0.45f, 6, Color{ 255, 255, 255, 40 });
+    DrawRectangleRoundedLines(ptrBox, 0.45f, 6, Color{ 255, 255, 255, 220 });
+
+    const char* ptrLabel = "next";
+    float ptrFontSize = 18;
+    Vector2 ptrLabelSize = MeasureTextEx(font, ptrLabel, ptrFontSize, 1);
+    Vector2 ptrPos = { ptrBox.x + (ptrBox.width - ptrLabelSize.x) / 2.0f,
+                       ptrBox.y + (ptrBox.height - ptrLabelSize.y) / 2.0f };
+    DrawTextEx(font, ptrLabel, ptrPos, ptrFontSize, 1, Color{ 255, 255, 255, 235 });
+}
+
+// Count nodes in list
+static int GetListLength(VNode* head) {
+    int c = 0;
+    for (VNode* p = head; p != nullptr; p = p->next) c++;
+    return c;
+}
+
+// Layout all node targets (horizontal for list, vertical for stack)
+static void LayoutTargetsCentered(VNode* head, float y, Font font) {
+    int n = GetListLength(head);
+    if (n == 0) return;
+
+    // Stack: vertical layout
+    if (gStructure == STRUCT_STACK) {
+        float gapY = 80.0f;
+        float startY = y - (n - 1) * gapY * 0.5f;
+        int idx = 0;
+        for (VNode* p = head; p != nullptr; p = p->next, ++idx) {
+            Vector2 newTarget = { 0.0f, startY + idx * gapY };
+            if (p->target.x != newTarget.x || p->target.y != newTarget.y) {
+                p->animStart = p->pos;
+                p->animT = 0.0f;
+                p->target = newTarget;
+            }
+            else if (p->animT >= 1.0f) {
+                p->pos = p->target;
+            }
+        }
+        return;
+    }
+
+    // List: horizontal layout
+    float maxWidth = 0.0f;
+    for (VNode* p = head; p != nullptr; p = p->next) {
+        float w = GetNodeWidth(p, font);
+        if (w > maxWidth) maxWidth = w;
+    }
+    float gap = maxWidth + 40.0f;
+    float totalWidth = (n - 1) * gap;
+    float startX = -totalWidth / 2.0f;
+    int idx = 0;
+    for (VNode* p = head; p != nullptr; p = p->next, ++idx) {
+        Vector2 newTarget = { startX + idx * gap, y };
+        if (p->target.x != newTarget.x || p->target.y != newTarget.y) {
+            p->animStart = p->pos;
+            p->animT = 0.0f;
+            p->target = newTarget;
+        }
+        else if (p->animT >= 1.0f) {
+            p->pos = p->target;
+        }
+    }
+}
+
+// Animate node positions (jump arc)
+static void AnimateNodes(VNode* head, float dt) {
+    const float speed = 3.0f;
+    const float jumpHeight = 30.0f;
+    const float pi = 3.14159265f;
+    for (VNode* p = head; p != nullptr; p = p->next) {
+        if (p->animT < 1.0f) {
+            p->animT += dt * speed;
+            if (p->animT > 1.0f) p->animT = 1.0f;
+        }
+        float t = p->animT;
+        Vector2 base = LerpVec2(p->animStart, p->target, t);
+        float arc = sinf(t * pi) * jumpHeight;
+        p->pos = { base.x, base.y - arc };
+    }
+}
+
+// Clear visual highlights
+static void ClearHighlights() {
+    gHasSearchHighlight = false;
+    gHasMinMaxHighlight = false;
+}
+
+// =====================
+// Visual operations on list / stack
+// =====================
+
+// Insert node at beginning (used for both list and stack PUSH)
+static void InsertAtBeginningVisual(VNode*& head, const string& value) {
+    VNode* n = new VNode(value);
+    n->pos = { -400.0f, -50.0f };
+    n->target = n->pos;
+    n->animStart = n->pos;
+    n->animT = 0.0f;
+    n->next = head;
+    head = n;
+}
+
+// Insert node at end (list only)
+static void InsertAtEndVisual(VNode*& head, const string& value) {
+    VNode* n = new VNode(value);
+    n->pos = { 400.0f, -50.0f };
+    n->target = n->pos;
+    n->animStart = n->pos;
+    n->animT = 0.0f;
+    n->next = nullptr;
+    if (head == nullptr) {
+        head = n;
+        return;
+    }
+    VNode* p = head;
+    while (p->next != nullptr) p = p->next;
+    p->next = n;
+}
+
+// Insert newValue after first node with afterValue (list-only helper)
+static void InsertAfterValueVisual(VNode*& head, const string& newValue, const string& afterValue) {
+    if (head == nullptr) {
+        InsertAtBeginningVisual(head, newValue);
+        return;
+    }
+    VNode* p = head;
+    while (p != nullptr && !ValueEquals(p->value, afterValue)) {
+        p = p->next;
+    }
+    if (p == nullptr) {
+        InsertAtEndVisual(head, newValue);
+        return;
+    }
+    VNode* n = new VNode(newValue);
+    n->pos = { p->pos.x, p->pos.y - 120.0f };
+    n->target = n->pos;
+    n->animStart = n->pos;
+    n->animT = 0.0f;
+    n->next = p->next;
+    p->next = n;
+}
+
+// Delete from beginning (list / stack POP)
+static bool DeleteFromBeginningVisual(VNode*& head) {
+    if (!head) return false;
+    VNode* temp = head;
+    head = head->next;
+    delete temp;
+    return true;
+}
+
+// Delete from end (list only)
+static bool DeleteFromEndVisual(VNode*& head) {
+    if (!head) return false;
+    if (!head->next) {
+        delete head;
+        head = nullptr;
+        return true;
+    }
+    VNode* prev = nullptr;
+    VNode* cur = head;
+    while (cur->next) {
+        prev = cur;
+        cur = cur->next;
+    }
+    prev->next = nullptr;
+    delete cur;
+    return true;
+}
+
+// Reverse list (list only)
+static bool ReverseListVisual(VNode*& head) {
+    if (!head) return false;
+    VNode* prev = nullptr;
+    VNode* cur = head;
+    while (cur) {
+        VNode* next = cur->next;
+        cur->next = prev;
+        prev = cur;
+        cur = next;
+    }
+    head = prev;
+    return true;
+}
+
+// Compute min/max (for INT mode)
+static bool UpdateMinMaxHighlight(VNode* head) {
+    if (!head) {
+        gHasMinMaxHighlight = false;
+        return false;
+    }
+    if (gValueType != VALUE_INT) {
+        gHasMinMaxHighlight = false;
+        return false;
+    }
+    bool any = false;
+    int mn = 0, mx = 0;
+    for (VNode* p = head; p != nullptr; p = p->next) {
+        int v;
+        if (!TryParseInt(p->value, v)) continue;
+        if (!any) {
+            any = true;
+            mn = mx = v;
+        }
+        else {
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+    }
+    if (!any) {
+        gHasMinMaxHighlight = false;
+        return false;
+    }
+    gMinValue = mn;
+    gMaxValue = mx;
+    gHasMinMaxHighlight = true;
+    gHasSearchHighlight = false;
+    return true;
+}
+
+// Clear entire list / stack and reset traversal state
+static void ClearList(VNode*& head) {
+    while (head != nullptr) {
+        VNode* temp = head;
+        head = head->next;
+        delete temp;
+    }
+    ClearHighlights();
+    gTraversal.active = false;
+    gTraversal.current = nullptr;
+    gTraversal.previous = nullptr;
+    // إذا في Bubble Sort شغال نوقفه
+    gBubble.active = false;
+}
+
+// Shorten long values in side panels
+static string ShortenForLabel(const string& s, int maxChars) {
+    if ((int)s.size() <= maxChars) return s;
+    if (maxChars <= 3) return s.substr(0, maxChars);
+    return s.substr(0, maxChars - 3) + "...";
+}
+
+// Set global time complexity text
+static void SetTimeComplexity(const string& op, const string& best,
+    const string& avg, const string& worst) {
+    gTCOperation = op;
+    gTCBest = best;
+    gTCAvg = avg;
+    gTCWorst = worst;
+}
+
+// Update complexity panel according to mode + structure
+static void UpdateTimeComplexityForMode(Mode mode) {
+    // First handle stack
+    if (gStructure == STRUCT_STACK) {
+        switch (mode) {
+        case MODE_BEGIN:       SetTimeComplexity("STACK PUSH (TOP)", "O(1)", "O(1)", "O(1)"); break;
+        case MODE_DEL_BEGIN:   SetTimeComplexity("STACK POP (TOP)", "O(1)", "O(1)", "O(1)"); break;
+        case MODE_STACK_PEEK:  SetTimeComplexity("STACK PEEK (TOP)", "O(1)", "O(1)", "O(1)"); break;
+        case MODE_SEARCH:      SetTimeComplexity("STACK SEARCH", "O(1)", "O(n)", "O(n)"); break;
+        case MODE_CLEAR:       SetTimeComplexity("CLEAR STACK", "O(n)", "O(n)", "O(n)"); break;
+        default:               SetTimeComplexity("STACK", "-", "-", "-"); break;
+        }
+        return;
+    }
+
+    // List
+    switch (mode) {
+    case MODE_BEGIN:      SetTimeComplexity("Insert at BEGINNING", "O(1)", "O(1)", "O(1)"); break;
+    case MODE_END:        SetTimeComplexity("Insert at END", "O(1)", "O(n)", "O(n)"); break;
+    case MODE_POS:        SetTimeComplexity("Insert AFTER VALUE", "O(1)", "O(n)", "O(n)"); break;
+    case MODE_SET:        SetTimeComplexity("SET node VALUE", "O(1)", "O(n)", "O(n)"); break;
+    case MODE_DEL_VAL:    SetTimeComplexity("Delete by VALUE", "O(1)", "O(n)", "O(n)"); break;
+    case MODE_DEL_BEGIN:  SetTimeComplexity("Delete from BEGINNING", "O(1)", "O(1)", "O(1)"); break;
+    case MODE_DEL_END:    SetTimeComplexity("Delete from END", "O(1)", "O(n)", "O(n)"); break;
+    case MODE_SEARCH:     SetTimeComplexity("SEARCH VALUE", "O(1)", "O(n)", "O(n)"); break;
+    case MODE_REVERSE:    SetTimeComplexity("REVERSE LIST", "O(n)", "O(n)", "O(n)"); break;
+    case MODE_MINMAX:     SetTimeComplexity("MIN / MAX highlight", "O(n)", "O(n)", "O(n)"); break;
+    case MODE_CLEAR:      SetTimeComplexity("CLEAR LIST", "O(n)", "O(n)", "O(n)"); break;
+    case MODE_BUBBLE_SORT:SetTimeComplexity("BUBBLE SORT (list)", "O(n)", "O(n^2)", "O(n^2)"); break;
+    case MODE_STACK_PEEK: SetTimeComplexity("PEEK", "O(1)", "O(1)", "O(1)"); break;
+    }
+}
+
+// Left panel: basic info about list/stack
+static void DrawListInfoPanel(Font font, VNode* head) {
+    float panelWidth = 260.0f;
+    float panelHeight = 190.0f;
+    float x = 30.0f;
+    float y = 100.0f;
+
+    Rectangle shadow = { x + 4, y + 6, panelWidth, panelHeight };
+    DrawRectangleRounded(shadow, 0.20f, 12, Color{ 0, 0, 0, 24 });
+
+    Color panelFill = (gTheme == THEME_LIGHT) ? Color{ 255, 255, 255, 240 } : Color{ 32, 35, 55, 240 };
+    Color panelBorder = (gTheme == THEME_LIGHT) ? Color{ 215, 220, 235, 255 } : Color{ 110, 115, 160, 255 };
+    Color titleColor = (gTheme == THEME_LIGHT) ? Color{ 50, 60, 90, 255 } : Color{ 220, 225, 255, 255 };
+    Color textColor = (gTheme == THEME_LIGHT) ? Color{ 70, 75, 110, 255 } : Color{ 215, 220, 245, 255 };
+
+    Rectangle panel = { x, y, panelWidth, panelHeight };
+    DrawRectangleRounded(panel, 0.20f, 12, panelFill);
+    DrawRectangleRoundedLines(panel, 0.20f, 12, panelBorder);
+
+    DrawTextEx(font, "List Info", Vector2{ x + 18, y + 14 }, 22, 1, titleColor);
+
+    float textY = y + 52.0f;
+    float lineH = 26.0f;
+    float fs = 18.0f;
+
+    string structLine = string("Structure: ") +
+        (gStructure == STRUCT_LIST ? "LIST" : "STACK");
+    DrawTextEx(font, structLine.c_str(), Vector2{ x + 18, textY }, fs, 1, textColor);
+    textY += lineH;
+
+    string typeLine = string("Type: ") + (gValueType == VALUE_INT ? "INT" : "STRING");
+    DrawTextEx(font, typeLine.c_str(), Vector2{ x + 18, textY }, fs, 1, textColor);
+    textY += lineH;
+
+    int length = GetListLength(head);
+    string lengthLine = string("Length: ") + to_string(length);
+    DrawTextEx(font, lengthLine.c_str(), Vector2{ x + 18, textY }, fs, 1, textColor);
+    textY += lineH;
+
+    if (head) {
+        string headLabel = (gStructure == STRUCT_LIST ? "Head: " : "Top: ");
+        string headLine = headLabel + ShortenForLabel(head->value, 10);
+        DrawTextEx(font, headLine.c_str(), Vector2{ x + 18, textY }, fs, 1, textColor);
+        textY += lineH;
+        VNode* tail = head;
+        while (tail->next) tail = tail->next;
+        string tailLabel = (gStructure == STRUCT_LIST ? "Tail: " : "Bottom: ");
+        string tailLine = tailLabel + ShortenForLabel(tail->value, 10);
+        DrawTextEx(font, tailLine.c_str(), Vector2{ x + 18, textY }, fs, 1, textColor);
+    }
+    else {
+        DrawTextEx(font, (gStructure == STRUCT_LIST ? "Head: -" : "Top: -"),
+            Vector2{ x + 18, textY }, fs, 1, textColor);
+        textY += lineH;
+        DrawTextEx(font, (gStructure == STRUCT_LIST ? "Tail: -" : "Bottom: -"),
+            Vector2{ x + 18, textY }, fs, 1, textColor);
+    }
+}
+
+// Time complexity panel (left side)
+static void DrawComplexityPanel(Font font) {
+    float panelWidth = 270.0f;
+    float panelHeight = 190.0f;
+    float x = 30.0f;
+
+    float infoTop = 90.0f;
+    float infoHeight = 190.0f;
+    float y = infoTop + infoHeight + 20.0f;
+
+    Rectangle shadow = { x + 4, y + 6, panelWidth, panelHeight };
+    DrawRectangleRounded(shadow, 0.20f, 12, Color{ 0, 0, 0, 24 });
+
+    Color panelFill = (gTheme == THEME_LIGHT) ? Color{ 255, 255, 255, 240 } : Color{ 32, 35, 55, 240 };
+    Color panelBorder = (gTheme == THEME_LIGHT) ? Color{ 215, 220, 235, 255 } : Color{ 110, 115, 160, 255 };
+    Color titleColor = (gTheme == THEME_LIGHT) ? Color{ 50, 60, 90, 255 } : Color{ 220, 225, 255, 255 };
+    Color textBest = (gTheme == THEME_LIGHT) ? Color{ 60, 140, 80, 255 } : Color{ 140, 220, 160, 255 };
+    Color textWorst = (gTheme == THEME_LIGHT) ? Color{ 170, 70, 70, 255 } : Color{ 230, 120, 120, 255 };
+    Color textNormal = (gTheme == THEME_LIGHT) ? Color{ 70, 75, 110, 255 } : Color{ 215, 220, 245, 255 };
+
+    Rectangle panel = { x, y, panelWidth, panelHeight };
+    DrawRectangleRounded(panel, 0.20f, 12, panelFill);
+    DrawRectangleRoundedLines(panel, 0.20f, 12, panelBorder);
+
+    DrawTextEx(font, "Time Complexity", Vector2{ x + 20, y + 12 }, 20, 1, titleColor);
+
+    float textY = y + 46.0f;
+    float fs = 15.0f;
+    float lineH = 22.0f;
+    string opLabel = "Operation: " + gTCOperation;
+
+    DrawOperationBodyLines(font, opLabel, Rectangle{ x + 20, textY, panelWidth - 40.0f, 60.0f });
+    textY += 64.0f;
+
+    DrawTextEx(font, ("Best-case:  " + gTCBest).c_str(), Vector2{ x + 20, textY }, fs, 1, textBest);
+    textY += lineH;
+    DrawTextEx(font, ("Average:    " + gTCAvg).c_str(), Vector2{ x + 20, textY }, fs, 1, textNormal);
+    textY += lineH;
+    DrawTextEx(font, ("Worst-case: " + gTCWorst).c_str(), Vector2{ x + 20, textY }, fs, 1, textWorst);
+}
+
+// Pointers panel shows head/current/previous pointer values
+static void DrawPointersPanel(Font font, VNode* head) {
+    float panelWidth = 260.0f;
+    float panelHeight = 150.0f;
+    float x = 30.0f;
+
+    float infoTop = 90.0f;
+    float infoHeight = 190.0f;
+    float complexityHeight = 190.0f;
+    float y = infoTop + infoHeight + 20.0f + complexityHeight + 18.0f;
+
+    Rectangle shadow = { x + 4, y + 6, panelWidth, panelHeight };
+    DrawRectangleRounded(shadow, 0.20f, 12, Color{ 0, 0, 0, 24 });
+
+    Color panelFill = (gTheme == THEME_LIGHT) ? Color{ 255, 255, 255, 240 } : Color{ 32, 35, 55, 240 };
+    Color panelBorder = (gTheme == THEME_LIGHT) ? Color{ 215, 220, 235, 255 } : Color{ 110, 115, 160, 255 };
+    Color titleColor = (gTheme == THEME_LIGHT) ? Color{ 50, 60, 90, 255 } : Color{ 220, 225, 255, 255 };
+    Color textColor = (gTheme == THEME_LIGHT) ? Color{ 70, 75, 110, 255 } : Color{ 215, 220, 245, 255 };
+
+    Rectangle panel = { x, y, panelWidth, panelHeight };
+    DrawRectangleRounded(panel, 0.20f, 12, panelFill);
+    DrawRectangleRoundedLines(panel, 0.20f, 12, panelBorder);
+
+    DrawTextEx(font, "Pointers", Vector2{ x + 18, y + 14 }, 22, 1, titleColor);
+
+    float textY = y + 52.0f;
+    float lineH = 24.0f;
+    float fs = 17.0f;
+
+    string headName = (gStructure == STRUCT_LIST ? "headPtr" : "topPtr");
+
+    string headLine = string("Node* ") + headName + " -> ";
+    if (head) headLine += ShortenForLabel(head->value, 10);
+    else headLine += "-";
+
+    VNode* cur = (gTraversal.active ? gTraversal.current : nullptr);
+    VNode* prev = (gTraversal.active ? gTraversal.previous : nullptr);
+
+    string curLine = "Node* currentPtr -> ";
+    curLine += (cur ? ShortenForLabel(cur->value, 10) : "-");
+
+    string prevLine = "Node* previousPtr -> ";
+    prevLine += (prev ? ShortenForLabel(prev->value, 10) : "-");
+
+    DrawTextEx(font, headLine.c_str(), Vector2{ x + 18, textY }, fs, 1, textColor);
+    textY += lineH;
+    DrawTextEx(font, curLine.c_str(), Vector2{ x + 18, textY }, fs, 1, textColor);
+    textY += lineH;
+    DrawTextEx(font, prevLine.c_str(), Vector2{ x + 18, textY }, fs, 1, textColor);
+}
+
+// =====================
+// Bubble Sort Update (NEW)
+// =====================
+//
+// هذه الدالة تنفّذ خطوة واحدة من الـ Bubble Sort
+// وتستخدم gStepMode و زر N إذا كان step mode شغّال
+//
+static void UpdateBubbleSort(VNode*& head, float dt, string& statusMsg, float& statusTimer) {
+    if (!gBubble.active) return;
+    if (!head || !head->next) {
+        gBubble.active = false;
+        return;
+    }
+
+    bool doStep = false;
+
+    if (gStepMode) {
+        if (gStepAdvanceRequested) {
+            doStep = true;
+            gStepAdvanceRequested = false;
+        }
+    }
+    else {
+        gBubble.stepTimer += dt;
+        if (gBubble.stepTimer >= 0.8f) {
+            gBubble.stepTimer = 0.0f;
+            doStep = true;
+        }
+    }
+
+    // دايمًا حط الـ CURRENT / PREVIOUS عشان الأسهم
+    gTraversal.active = true;
+    gTraversal.mode = MODE_BUBBLE_SORT;
+    gTraversal.current = gBubble.curr;
+    gTraversal.previous = gBubble.prev;
+
+    if (!doStep) return;
+
+    // إذا وصلنا نهاية الـ pass (curr->next == lastSorted أو null)
+    if (!gBubble.curr->next || gBubble.curr->next == gBubble.lastSorted) {
+        gBubble.lastSorted = gBubble.curr;
+
+        if (!gBubble.swappedInPass) {
+            // خلاص الـ list مترتبة
+            gBubble.active = false;
+            gTraversal.active = false;
+            statusMsg = "Bubble sort finished.";
+            statusTimer = 2.5f;
+            return;
+        }
+
+        // نبدأ pass جديد من البداية
+        gBubble.prev = nullptr;
+        gBubble.curr = head;
+        gBubble.swappedInPass = false;
+        gBubble.stepTimer = 0.0f;
+
+        gTraversal.current = gBubble.curr;
+        gTraversal.previous = gBubble.prev;
+        return;
+    }
+
+    // عندنا زوج curr / next جاهز للمقارنة
+    VNode* prev = gBubble.prev;
+    VNode* curr = gBubble.curr;
+    VNode* next = curr->next;
+
+    int a, b;
+    bool ok1 = TryParseInt(curr->value, a);
+    bool ok2 = TryParseInt(next->value, b);
+
+    if (ok1 && ok2 && a > b) {
+        // swap nodes في الـ linked list
+        VNode* tmp = next->next;
+
+        if (prev) prev->next = next;
+        else      head = next;
+
+        next->next = curr;
+        curr->next = tmp;
+
+        gBubble.swappedInPass = true;
+
+        // بعد الـ swap: prev يتحرك إلى next (اللي صار قبل curr)
+        gBubble.prev = next;
+        gBubble.curr = curr;
+    }
+    else {
+        // بدون swap: نزحلق المؤشرات قدّام
+        gBubble.prev = curr;
+        gBubble.curr = next;
+    }
+
+    // حدّث ال traversal arrows
+    gTraversal.active = true;
+    gTraversal.mode = MODE_BUBBLE_SORT;
+    gTraversal.current = gBubble.curr;
+    gTraversal.previous = gBubble.prev;
+}
+
+// =====================
+// main
+// =====================
+
+int main() {
+    // Basic window setup
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
+    InitWindow(1100, 650, "LINKED LIST OPERATIONS");
+    SetExitKey(KEY_NULL);
+    SetTargetFPS(60);
+
+    // Font loading
+    Font font;
+    bool customFontLoaded = false;
+    if (FileExists("resources/Mono.ttf")) {
+        font = LoadFontEx("resources/Mono.ttf", 22, nullptr, 0);
+        customFontLoaded = true;
+    }
+    else {
+        font = GetFontDefault();
+    }
+    SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
+
+    // List / stack head pointer
+    VNode* head = nullptr;
+
+    // User input buffer and state
+    string inputValue = "";
+    bool submitted = false;
+
+    // Initial mode
+    Mode mode = MODE_BEGIN;
+    UpdateTimeComplexityForMode(mode);
+
+    bool awaitingSecondInput = false;
+    string pendingValue;
+
+    string statusMsg = "";
+    float statusTimer = 0.0f;
+
+    // Camera for panning/zooming around the list
+    Camera2D cam = { 0 };
+    cam.target = { 0, 0 };
+    cam.offset = { (float)GetScreenWidth() / 2, (float)GetScreenHeight() / 2 };
+    cam.rotation = 0.0f;
+    cam.zoom = 1.0f;
+
+    bool panning = false;
+    Vector2 lastMouse = { 0,0 };
+
+    const float listY = 260.0f;
+
+    // Initial operation note
+    SetOperationNote(
+        "LINKED LIST",
+        "Visualize a singly linked list.\n"
+        "Use the menu in the center to apply operations.\n"
+        "Toggle structure to STACK to see stack operations."
+    );
+
+    // ----------------------
+    // Main loop
+    // ----------------------
+    while (!WindowShouldClose()) {
+        float dt = GetFrameTime();
+        cam.offset = { (float)GetScreenWidth() / 2, (float)GetScreenHeight() / 2 };
+
+        gStepAdvanceRequested = false;
+
+        Mode oldMode = mode;
+
+        // Input handling
+        bool numericMode = (gValueType == VALUE_INT);
+        UpdateInput(inputValue, submitted, numericMode);
+
+        if (gStepMode && IsKeyPressed(KEY_N)) {
+            gStepAdvanceRequested = true;
+        }
+
+        // ESC cancels current multi-step operation
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            if (awaitingSecondInput || !inputValue.empty()) {
+                awaitingSecondInput = false;
+                inputValue.clear();
+                statusMsg = "Operation cancelled";
+                statusTimer = 1.5f;
+                gTraversal.active = false;
+                gTraversal.current = nullptr;
+                gTraversal.previous = nullptr;
+                gBubble.active = false;
+            }
+        }
+
+        // =====================
+        // Handle submitted input (ENTER)
+        // =====================
+        if (submitted) {
+            if (!awaitingSecondInput) {
+                // ----------------
+                // Single-input phase
+                // ----------------
+
+                // STACK structure logic (PUSH / SEARCH handled here)
+                if (gStructure == STRUCT_STACK) {
+                    if (mode == MODE_BEGIN) { // PUSH
+                        if (gValueType == VALUE_INT) {
+                            int dummy;
+                            if (!TryParseInt(inputValue, dummy)) {
+                                statusMsg = "Invalid integer";
+                            }
+                            else {
+                                InsertAtBeginningVisual(head, inputValue);
+                                ClearHighlights();
+                                statusMsg = "PUSH " + inputValue + " to TOP";
+                                SetOperationNote(
+                                    "STACK PUSH",
+                                    "Node* newNode = new Node(value);\n"
+                                    "newNode->next = top;\n"
+                                    "top = newNode;"
+                                );
+                            }
+                        }
+                        else {
+                            int dummy;
+                            if (TryParseInt(inputValue, dummy)) {
+                                statusMsg = "In STRING mode you cannot insert pure numbers";
+                            }
+                            else {
+                                InsertAtBeginningVisual(head, inputValue);
+                                ClearHighlights();
+                                statusMsg = "PUSH \"" + inputValue + "\" to TOP";
+                                SetOperationNote(
+                                    "STACK PUSH",
+                                    "Node* newNode = new Node(value);\n"
+                                    "newNode->next = top;\n"
+                                    "top = newNode;"
+                                );
+                            }
+                        }
+                        statusTimer = 2.5f;
+                    }
+                    else if (mode == MODE_SEARCH) { // STACK SEARCH
+                        if (!head) {
+                            statusMsg = "Cannot search - stack is empty";
+                            statusTimer = 2.5f;
+                        }
+                        else {
+                            gTraversal.active = true;
+                            gTraversal.mode = MODE_SEARCH;
+                            gTraversal.targetValue = inputValue;
+                            gTraversal.pendingNewValue.clear();
+                            gTraversal.current = head;
+                            gTraversal.previous = nullptr;
+                            gTraversal.stepTimer = 0.0f;
+                            if (gStepMode)
+                                statusMsg = "Stack search (step) - press N to move to next node";
+                            else
+                                statusMsg = "Searching in stack for " + inputValue + "...";
+                            statusTimer = 3.0f;
+                            gHasSearchHighlight = false;
+                            gHasMinMaxHighlight = false;
+                            SetOperationNote(
+                                "STACK SEARCH",
+                                "Node* current = top;\n"
+                                "while (current != nullptr) {\n"
+                                "    if (current->value == x) break;\n"
+                                "    current = current->next;\n"
+                                "}"
+                            );
+                        }
+                    }
+                }
+                else {
+                    // ----------------
+                    // LIST structure logic
+                    // ----------------
+                    if (mode == MODE_BEGIN) {
+                        if (gValueType == VALUE_INT) {
+                            int dummy;
+                            if (!TryParseInt(inputValue, dummy)) {
+                                statusMsg = "Invalid integer";
+                            }
+                            else {
+                                InsertAtBeginningVisual(head, inputValue);
+                                ClearHighlights();
+                                statusMsg = "Inserted " + inputValue + " at beginning";
+                                SetOperationNote(
+                                    "Insert at BEGINNING",
+                                    "Node* newNode = new Node(value);\n"
+                                    "newNode->next = head;\n"
+                                    "head = newNode;"
+                                );
+                            }
+                        }
+                        else {
+                            int dummy;
+                            if (TryParseInt(inputValue, dummy)) {
+                                statusMsg = "In STRING mode you cannot insert pure numbers";
+                            }
+                            else {
+                                InsertAtBeginningVisual(head, inputValue);
+                                ClearHighlights();
+                                statusMsg = "Inserted \"" + inputValue + "\" at beginning";
+                                SetOperationNote(
+                                    "Insert at BEGINNING",
+                                    "Node* newNode = new Node(value);\n"
+                                    "newNode->next = head;\n"
+                                    "head = newNode;"
+                                );
+                            }
+                        }
+                        statusTimer = 2.5f;
+                    }
+                    else if (mode == MODE_END) {
+                        if (gValueType == VALUE_INT) {
+                            int dummy;
+                            if (!TryParseInt(inputValue, dummy)) {
+                                statusMsg = "Invalid integer";
+                            }
+                            else {
+                                InsertAtEndVisual(head, inputValue);
+                                ClearHighlights();
+                                statusMsg = "Inserted " + inputValue + " at end";
+                                SetOperationNote(
+                                    "Insert at END",
+                                    "Node* newNode = new Node(value);\n"
+                                    "if (head == nullptr) head = newNode;\n"
+                                    "else {\n"
+                                    "    Node* p = head;\n"
+                                    "    while (p->next != nullptr)\n"
+                                    "        p = p->next;\n"
+                                    "    p->next = newNode;\n"
+                                    "}"
+                                );
+                            }
+                        }
+                        else {
+                            int dummy;
+                            if (TryParseInt(inputValue, dummy)) {
+                                statusMsg = "In STRING mode you cannot insert pure numbers";
+                            }
+                            else {
+                                InsertAtEndVisual(head, inputValue);
+                                ClearHighlights();
+                                statusMsg = "Inserted \"" + inputValue + "\" at end";
+                                SetOperationNote(
+                                    "Insert at END",
+                                    "Node* newNode = new Node(value);\n"
+                                    "if (head == nullptr) head = newNode;\n"
+                                    "else {\n"
+                                    "    Node* p = head;\n"
+                                    "    while (p->next != nullptr)\n"
+                                    "        p = p->next;\n"
+                                    "    p->next = newNode;\n"
+                                    "}"
+                                );
+                            }
+                        }
+                        statusTimer = 2.5f;
+                    }
+                    else if (mode == MODE_POS) {
+                        // First step: store new value, second step: after-value
+                        if (gValueType == VALUE_INT) {
+                            int dummy;
+                            if (!TryParseInt(inputValue, dummy)) {
+                                statusMsg = "Invalid integer";
+                                statusTimer = 2.5f;
+                            }
+                            else {
+                                pendingValue = inputValue;
+                                awaitingSecondInput = true;
+                                statusMsg = "New value " + pendingValue + " captured, now enter AFTER VALUE";
+                                statusTimer = 2.5f;
+                                SetOperationNote(
+                                    "Insert AFTER VALUE - Step 1",
+                                    string("new node value = ") + pendingValue +
+                                    "\nNode* p = head;\n"
+                                    "while (p != nullptr && p->value != afterVal)\n"
+                                    "    p = p->next;\n"
+                                    "Next step: choose afterVal."
+                                );
+                            }
+                        }
+                        else {
+                            int dummy;
+                            if (TryParseInt(inputValue, dummy)) {
+                                statusMsg = "In STRING mode you cannot insert pure numbers";
+                                statusTimer = 2.5f;
+                            }
+                            else {
+                                pendingValue = inputValue;
+                                awaitingSecondInput = true;
+                                statusMsg = "New value \"" + pendingValue + "\" captured, now enter AFTER VALUE";
+                                statusTimer = 2.5f;
+                                SetOperationNote(
+                                    "Insert AFTER VALUE - Step 1",
+                                    string("new node value = ") + pendingValue +
+                                    "\nNode* p = head;\n"
+                                    "while (p != nullptr && p->value != afterVal)\n"
+                                    "    p = p->next;\n"
+                                    "Next step: choose afterVal."
+                                );
+                            }
+                        }
+                    }
+                    else if (mode == MODE_SET) {
+                        // Step 1 for SET: capture old value
+                        pendingValue = inputValue;
+                        awaitingSecondInput = true;
+                        statusMsg = "Target value " + pendingValue + " captured, now enter NEW VALUE";
+                        statusTimer = 2.5f;
+                        SetOperationNote(
+                            "SET node VALUE - Step 1",
+                            string("target value = ") + pendingValue +
+                            "\nNode* p = head;\n"
+                            "while (p != nullptr && p->value != oldVal)\n"
+                            "    p = p->next;\n"
+                            "Next step: choose newVal."
+                        );
+                    }
+                    else if (mode == MODE_DEL_VAL) {
+                        if (!head) {
+                            statusMsg = "Cannot delete by value - list is empty";
+                            statusTimer = 2.5f;
+                        }
+                        else {
+                            gTraversal.active = true;
+                            gTraversal.mode = MODE_DEL_VAL;
+                            gTraversal.targetValue = inputValue;
+                            gTraversal.pendingNewValue.clear();
+                            gTraversal.current = head;
+                            gTraversal.previous = nullptr;
+                            gTraversal.stepTimer = 0.0f;
+                            ClearHighlights();
+                            if (gStepMode)
+                                statusMsg = "Delete by value (step) - press N to move to next node";
+                            else
+                                statusMsg = "Deleting value " + inputValue + " (traversing list)...";
+                            statusTimer = 3.0f;
+                            SetOperationNote(
+                                "Delete by VALUE",
+                                "Node* prev = nullptr;\n"
+                                "Node* cur  = head;\n"
+                                "while (cur != nullptr && cur->value != x) {\n"
+                                "    prev = cur;\n"
+                                "    cur  = cur->next;\n"
+                                "}\n"
+                                "If found, relink prev->next and delete cur."
+                            );
+                        }
+                    }
+                    else if (mode == MODE_SEARCH) {
+                        if (!head) {
+                            statusMsg = "Cannot search - list is empty";
+                            statusTimer = 2.5f;
+                        }
+                        else {
+                            gTraversal.active = true;
+                            gTraversal.mode = MODE_SEARCH;
+                            gTraversal.targetValue = inputValue;
+                            gTraversal.pendingNewValue.clear();
+                            gTraversal.current = head;
+                            gTraversal.previous = nullptr;
+                            gTraversal.stepTimer = 0.0f;
+                            if (gStepMode)
+                                statusMsg = "Searching (step mode) - press N to move to next node";
+                            else
+                                statusMsg = "Searching for " + inputValue + "...";
+                            statusTimer = 3.0f;
+                            gHasSearchHighlight = false;
+                            gHasMinMaxHighlight = false;
+                            SetOperationNote(
+                                "SEARCH VALUE",
+                                "Node* current = head;\n"
+                                "while (current != nullptr) {\n"
+                                "    if (current->value == x) {\n"
+                                "        break;\n"
+                                "    }\n"
+                                "    current = current->next;\n"
+                                "}"
+                            );
+                        }
+                    }
+                }
+
+                // Clear input after processing first step
+                inputValue.clear();
+            }
+            else {
+                // ----------------
+                // Second input (only for LIST in POS / SET)
+                // ----------------
+                string secondVal = inputValue;
+                if (mode == MODE_POS && gStructure == STRUCT_LIST) {
+                    if (!head) {
+                        statusMsg = "List is empty, inserting at beginning";
+                        InsertAtBeginningVisual(head, pendingValue);
+                        ClearHighlights();
+                        statusTimer = 2.5f;
+                    }
+                    else {
+                        gTraversal.active = true;
+                        gTraversal.mode = MODE_POS;
+                        gTraversal.targetValue = secondVal;
+                        gTraversal.pendingNewValue = pendingValue;
+                        gTraversal.current = head;
+                        gTraversal.previous = nullptr;
+                        gTraversal.stepTimer = 0.0f;
+                        ClearHighlights();
+                        if (gStepMode)
+                            statusMsg = "Traversing (step mode) - press N to move to next node";
+                        else
+                            statusMsg = "Traversing list to insert after " + secondVal;
+                        statusTimer = 3.0f;
+                        SetOperationNote(
+                            "Insert AFTER VALUE",
+                            "Node* p = head;\n"
+                            "while (p != nullptr && p->value != afterVal)\n"
+                            "    p = p->next;\n"
+                            "If p == nullptr: insert at END;\n"
+                            "else insert new node after p."
+                        );
+                    }
+                }
+                else if (mode == MODE_SET && gStructure == STRUCT_LIST) {
+                    bool canSet = true;
+                    if (gValueType == VALUE_INT) {
+                        int dummy;
+                        if (!TryParseInt(secondVal, dummy)) {
+                            statusMsg = "Invalid integer";
+                            statusTimer = 2.5f;
+                            canSet = false;
+                            SetOperationNote(
+                                "SET node VALUE (INT mode)",
+                                "New value must be a valid integer."
+                            );
+                        }
+                    }
+                    if (gValueType == VALUE_STRING) {
+                        int dummy;
+                        if (TryParseInt(secondVal, dummy)) {
+                            statusMsg = "In STRING mode you cannot set pure numbers";
+                            statusTimer = 2.5f;
+                            canSet = false;
+                            SetOperationNote(
+                                "SET node VALUE (STRING mode)",
+                                "In STRING mode, nodes cannot hold pure numeric values.\n"
+                                "Choose a new value that is not only digits."
+                            );
+                        }
+                    }
+                    if (canSet) {
+                        if (!head) {
+                            statusMsg = "Cannot set - list is empty";
+                            statusTimer = 2.5f;
+                        }
+                        else {
+                            gTraversal.active = true;
+                            gTraversal.mode = MODE_SET;
+                            gTraversal.targetValue = pendingValue;
+                            gTraversal.pendingNewValue = secondVal;
+                            gTraversal.current = head;
+                            gTraversal.previous = nullptr;
+                            gTraversal.stepTimer = 0.0f;
+                            ClearHighlights();
+                            if (gStepMode)
+                                statusMsg = "SET value (step) - press N to move to next node";
+                            else
+                                statusMsg = "SET value - traversing to find " + pendingValue;
+                            statusTimer = 3.0f;
+                            SetOperationNote(
+                                "SET node VALUE",
+                                "Node* p = head;\n"
+                                "while (p != nullptr && p->value != oldVal)\n"
+                                "    p = p->next;\n"
+                                "If found, p->value = newVal."
+                            );
+                        }
+                    }
+                }
+                awaitingSecondInput = false;
+                inputValue.clear();
+            }
+        }
+
+        // =====================
+        // Camera controls
+        // =====================
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
+                // CTRL + wheel = zoom
+                float zoomFactor = 1.0f + wheel * 0.10f;
+                cam.zoom *= zoomFactor;
+                if (cam.zoom < 0.5f) cam.zoom = 0.5f;
+                if (cam.zoom > 1.8f) cam.zoom = 1.8f;
+            }
+            else {
+                // Wheel alone = horizontal scroll
+                float scrollSpeed = 120.0f;
+                cam.target.x -= wheel * scrollSpeed / cam.zoom;
+            }
+        }
+
+        // Middle mouse drag = pan
+        if (IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE)) {
+            panning = true;
+            lastMouse = GetMousePosition();
+        }
+        if (IsMouseButtonReleased(MOUSE_BUTTON_MIDDLE)) panning = false;
+        if (panning) {
+            Vector2 m = GetMousePosition();
+            Vector2 delta = { m.x - lastMouse.x, m.y - lastMouse.y };
+            cam.target.x -= delta.x / cam.zoom;
+            cam.target.y -= delta.y / cam.zoom;
+            lastMouse = m;
+        }
+
+        // Layout + animation
+        LayoutTargetsCentered(head, listY, font);
+        AnimateNodes(head, dt);
+
+        // Traversal animation logic (search, delete by value, set, etc.)
+        if (gTraversal.active && !gBubble.active) {   // إذا بابل شغّال ما نتحكم من هنا
+            if (!head) {
+                gTraversal.active = false;
+                gTraversal.current = nullptr;
+                gTraversal.previous = nullptr;
+            }
+            else {
+                bool doStep = false;
+                if (gStepMode) {
+                    if (gStepAdvanceRequested) {
+                        doStep = true;
+                        gStepAdvanceRequested = false;
+                    }
+                }
+                else {
+                    gTraversal.stepTimer += dt;
+                    float delay = 0.8f;
+                    if (gTraversal.stepTimer >= delay) {
+                        gTraversal.stepTimer = 0.0f;
+                        doStep = true;
+                    }
+                }
+
+                if (doStep) {
+                    if (gTraversal.current == nullptr) {
+                        // Reached end without finding
+                        if (gTraversal.mode == MODE_SEARCH) {
+                            statusMsg = "Value " + gTraversal.targetValue + " not found";
+                            statusTimer = 2.5f;
+                            gHasSearchHighlight = false;
+                        }
+                        else if (gTraversal.mode == MODE_POS) {
+                            InsertAtEndVisual(head, gTraversal.pendingNewValue);
+                            ClearHighlights();
+                            statusMsg = "Value " + gTraversal.targetValue +
+                                " not found - inserted " + gTraversal.pendingNewValue + " at end";
+                            statusTimer = 2.5f;
+                        }
+                        else if (gTraversal.mode == MODE_DEL_VAL) {
+                            statusMsg = "Value " + gTraversal.targetValue + " not found - nothing deleted";
+                            statusTimer = 2.5f;
+                        }
+                        else if (gTraversal.mode == MODE_SET) {
+                            statusMsg = "Cannot set - value " + gTraversal.targetValue + " not found";
+                            statusTimer = 2.5f;
+                        }
+                        gTraversal.active = false;
+                        gTraversal.previous = nullptr;
+                    }
+                    else {
+                        if (ValueEquals(gTraversal.current->value, gTraversal.targetValue)) {
+                            // Found node
+                            if (gTraversal.mode == MODE_SEARCH) {
+                                gSearchValue = gTraversal.targetValue;
+                                gHasSearchHighlight = true;
+                                gHasMinMaxHighlight = false;
+                                statusMsg = "Found value " + gTraversal.targetValue;
+                                statusTimer = 2.5f;
+                            }
+                            else if (gTraversal.mode == MODE_POS) {
+                                InsertAfterValueVisual(head, gTraversal.pendingNewValue, gTraversal.targetValue);
+                                ClearHighlights();
+                                statusMsg = "Inserted " + gTraversal.pendingNewValue +
+                                    " after " + gTraversal.targetValue;
+                                statusTimer = 2.5f;
+                            }
+                            else if (gTraversal.mode == MODE_DEL_VAL) {
+                                if (gTraversal.current == head) {
+                                    VNode* del = head;
+                                    head = head->next;
+                                    delete del;
+                                }
+                                else {
+                                    if (gTraversal.previous) {
+                                        VNode* del = gTraversal.current;
+                                        gTraversal.previous->next = gTraversal.current->next;
+                                        delete del;
+                                    }
+                                }
+                                ClearHighlights();
+                                statusMsg = "Deleted value " + gTraversal.targetValue;
+                                statusTimer = 2.5f;
+                            }
+                            else if (gTraversal.mode == MODE_SET) {
+                                gTraversal.current->value = gTraversal.pendingNewValue;
+                                ClearHighlights();
+                                statusMsg = "Changed value " + gTraversal.targetValue +
+                                    " to " + gTraversal.pendingNewValue;
+                                statusTimer = 2.5f;
+                            }
+                            gTraversal.active = false;
+                            gTraversal.previous = nullptr;
+                        }
+                        else {
+                            // Move to next node
+                            gTraversal.previous = gTraversal.current;
+                            gTraversal.current = gTraversal.current->next;
+                        }
+                    }
+                }
+            }
+        }
+
+        // === Bubble Sort step (
+
+
+
+        UpdateBubbleSort(head, dt, statusMsg, statusTimer);
+
+        // Hover detection in world space
+        Vector2 mouseWorld = GetScreenToWorld2D(GetMousePosition(), cam);
+        for (VNode* p = head; p != nullptr; p = p->next) {
+            float nodeWidth = GetNodeWidth(p, font);
+            Rectangle r = { p->pos.x - nodeWidth / 2.0f, p->pos.y - 32.0f, nodeWidth, 64.0f };
+            p->hover = CheckCollisionPointRec(mouseWorld, r);
+        }
+
+        // =====================
+        // DRAW
+        // =====================
+        BeginDrawing();
+        DrawNiceBackground();
+
+        Vector2 mouseScreen = GetMousePosition();
+
+        // ----- Title button -----
+        const char* title = "LINKED LIST OPERATIONS";
+        float titleSize = 26.0f;
+        Vector2 titleTextSize = MeasureTextEx(font, title, titleSize, 1);
+        float titleButtonWidth = titleTextSize.x + 40.0f;
+        float titleButtonHeight = titleTextSize.y + 16.0f;
+        float titleButtonX = (float)GetScreenWidth() / 2.0f - titleButtonWidth / 2.0f;
+        float titleButtonY = 10.0f;
+        Rectangle titleButtonRect = { titleButtonX, titleButtonY, titleButtonWidth, titleButtonHeight };
+
+        bool titleHover = CheckCollisionPointRec(mouseScreen, titleButtonRect);
+        Color titleFill = (gTheme == THEME_LIGHT) ? Color{ 245, 246, 255, 235 } : Color{ 40, 45, 75, 235 };
+        Color titleBorder = (gTheme == THEME_LIGHT) ? Color{ 190, 195, 230, 255 } : Color{ 120, 125, 180, 255 };
+        Color titleTextColor = (gTheme == THEME_LIGHT) ? Color{ 40, 50, 80, 245 } : Color{ 230, 235, 255, 245 };
+        if (titleHover) {
+            titleFill = (gTheme == THEME_LIGHT) ? Color{ 235, 238, 255, 245 } : Color{ 55, 60, 95, 245 };
+        }
+
+        DrawRectangleRounded(Rectangle{ titleButtonRect.x + 2, titleButtonRect.y + 3,
+            titleButtonRect.width, titleButtonRect.height }, 0.35f, 10, Color{ 0, 0, 0, 18 });
+        DrawRectangleRounded(titleButtonRect, 0.35f, 10, titleFill);
+        DrawRectangleRoundedLines(titleButtonRect, 0.35f, 10, titleBorder);
+
+        DrawTextEx(font, title,
+            Vector2{ titleButtonRect.x + (titleButtonRect.width - titleTextSize.x) / 2.0f,
+                     titleButtonRect.y + (titleButtonRect.height - titleTextSize.y) / 2.0f },
+            titleSize, 1, titleTextColor);
+
+        // "Click here" button to toggle operations menu
+        string clickLabel = "Click here";
+        float clickFont = 16.0f;
+        Vector2 clickSize = MeasureTextEx(font, clickLabel.c_str(), clickFont, 1.0f);
+        float clickW = clickSize.x + 24.0f;
+        float clickH = clickSize.y + 10.0f;
+        float clickX = titleButtonRect.x + titleButtonRect.width + 10.0f;
+        float clickY = titleButtonRect.y + (titleButtonRect.height - clickH) / 2.0f;
+        Rectangle clickRect = { clickX, clickY, clickW, clickH };
+        bool clickHover = CheckCollisionPointRec(mouseScreen, clickRect);
+
+        Color clickFill = clickHover ?
+            (gTheme == THEME_LIGHT ? Color{ 210, 215, 245, 255 } : Color{ 70, 75, 110, 255 }) :
+            (gTheme == THEME_LIGHT ? Color{ 235, 238, 255, 255 } : Color{ 50, 55, 90, 255 });
+        Color clickBorder = (gTheme == THEME_LIGHT) ? Color{ 180, 185, 225, 255 } : Color{ 120, 125, 180, 255 };
+        Color clickTextColor = (gTheme == THEME_LIGHT) ? Color{ 60, 70, 110, 255 } : Color{ 230, 235, 255, 255 };
+
+        DrawRectangleRounded(Rectangle{ clickRect.x + 2, clickRect.y + 2, clickRect.width, clickRect.height },
+            0.45f, 10, Color{ 0, 0, 0, 18 });
+        DrawRectangleRounded(clickRect, 0.45f, 10, clickFill);
+        DrawRectangleRoundedLines(clickRect, 0.45f, 10, clickBorder);
+
+        DrawTextEx(font, clickLabel.c_str(),
+            Vector2{ clickRect.x + (clickRect.width - clickSize.x) / 2.0f,
+                     clickRect.y + (clickRect.height - clickSize.y) / 2.0f },
+            clickFont, 1, clickTextColor);
+
+        if (clickHover && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            gTopMenuExpanded = !gTopMenuExpanded;
+        }
+
+        // Draw top badges/toggles
+        DrawModeBadge(font, mode);
+        Rectangle typeToggleRect = DrawTypeToggle(font);
+        Rectangle themeToggleRect = DrawThemeToggle(font);
+        Rectangle structureToggleRect = DrawStructureToggle(font);
+        Rectangle stepToggleRect = DrawStepToggle(font);
+
+        // Side panels
+        DrawLegend(font);
+        DrawOperationNote(font);
+        DrawListInfoPanel(font, head);
+        DrawComplexityPanel(font);
+        DrawPointersPanel(font, head);
+
+        // Bottom-left zoom info + "Center view" button
+        float fsZoom = 16.0f;
+        string zoomLabel = "Zoom: " + to_string((int)(cam.zoom * 100.0f + 0.5f)) + "%";
+        Vector2 zoomSize = MeasureTextEx(font, zoomLabel.c_str(), fsZoom, 1.0f);
+        float boxW = zoomSize.x + 24.0f;
+        float boxH = zoomSize.y + 10.0f;
+        float boxX = 30.0f;
+        float boxY = (float)GetScreenHeight() - boxH - 24.0f;
+        Rectangle zoomRect = { boxX, boxY, boxW, boxH };
+
+        Color panelFill = (gTheme == THEME_LIGHT) ? Color{ 255, 255, 255, 235 } : Color{ 40, 45, 75, 235 };
+        Color panelBorder = (gTheme == THEME_LIGHT) ? Color{ 210, 215, 235, 255 } : Color{ 120, 125, 180, 255 };
+        Color textCol = (gTheme == THEME_LIGHT) ? Color{ 60, 70, 110, 255 } : Color{ 230, 235, 255, 255 };
+
+        DrawRectangleRounded(Rectangle{ zoomRect.x + 2, zoomRect.y + 3, zoomRect.width, zoomRect.height },
+            0.35f, 10, Color{ 0, 0, 0, 18 });
+        DrawRectangleRounded(zoomRect, 0.35f, 10, panelFill);
+        DrawRectangleRoundedLines(zoomRect, 0.35f, 10, panelBorder);
+
+        DrawTextEx(font, zoomLabel.c_str(),
+            Vector2{ zoomRect.x + (zoomRect.width - zoomSize.x) / 2.0f,
+                     zoomRect.y + (zoomRect.height - zoomSize.y) / 2.0f },
+            fsZoom, 1, textCol);
+
+        string centerLabel = "Center view";
+        Vector2 centerSize = MeasureTextEx(font, centerLabel.c_str(), fsZoom, 1.0f);
+        float centerW = centerSize.x + 24.0f;
+        float centerH = centerSize.y + 10.0f;
+        float centerX = zoomRect.x + zoomRect.width + 10.0f;
+        float centerY = boxY;
+        Rectangle centerRect = { centerX, centerY, centerW, centerH };
+        bool centerHover = CheckCollisionPointRec(mouseScreen, centerRect);
+
+        Color centerFill = centerHover ?
+            (gTheme == THEME_LIGHT ? Color{ 230, 235, 255, 255 } : Color{ 70, 75, 110, 255 }) :
+            (gTheme == THEME_LIGHT ? Color{ 245, 247, 255, 255 } : Color{ 55, 60, 95, 255 });
+
+        DrawRectangleRounded(Rectangle{ centerRect.x + 2, centerRect.y + 3, centerRect.width, centerRect.height },
+            0.35f, 10, Color{ 0, 0, 0, 18 });
+        DrawRectangleRounded(centerRect, 0.35f, 10, centerFill);
+        DrawRectangleRoundedLines(centerRect, 0.35f, 10, panelBorder);
+
+        DrawTextEx(font, centerLabel.c_str(),
+            Vector2{ centerRect.x + (centerRect.width - centerSize.x) / 2.0f,
+                     centerRect.y + (centerRect.height - centerSize.y) / 2.0f },
+            fsZoom, 1, textCol);
+
+        if (centerHover && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            cam.target = { 0, 0 };
+            cam.zoom = 1.0f;
+            statusMsg = "Camera centered";
+            statusTimer = 1.5f;
+        }
+
+        // =====================
+        // Handle toggle clicks
+        // =====================
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) &&
+            CheckCollisionPointRec(mouseScreen, typeToggleRect)) {
+
+            // Change type and clear structure to avoid type mixing
+            if (gValueType == VALUE_INT) {
+                gValueType = VALUE_STRING;
+                statusMsg = "Type changed to STRING, structure cleared";
+            }
+            else {
+                gValueType = VALUE_INT;
+                statusMsg = "Type changed to INT, structure cleared";
+            }
+            statusTimer = 2.5f;
+            ClearList(head);
+            awaitingSecondInput = false;
+            inputValue.clear();
+            gTraversal.active = false;
+            gTraversal.current = nullptr;
+            gTraversal.previous = nullptr;
+            gBubble.active = false;
+
+            SetOperationNote(
+                "CHANGE TYPE",
+                "Change stored value type (INT / STRING)\n"
+                "and clear the structure to avoid conflicts."
+            );
+        }
+
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) &&
+            CheckCollisionPointRec(mouseScreen, themeToggleRect)) {
+            if (gTheme == THEME_LIGHT) {
+                gTheme = THEME_DARK;
+                statusMsg = "Switched to Dark theme";
+            }
+            else {
+                gTheme = THEME_LIGHT;
+                statusMsg = "Switched to Light theme";
+            }
+            statusTimer = 1.8f;
+        }
+
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) &&
+            CheckCollisionPointRec(mouseScreen, structureToggleRect)) {
+
+            gStructure = (gStructure == STRUCT_LIST ? STRUCT_STACK : STRUCT_LIST);
+            ClearList(head);
+            awaitingSecondInput = false;
+            inputValue.clear();
+            gTraversal.active = false;
+            gTraversal.current = nullptr;
+            gTraversal.previous = nullptr;
+            gBubble.active = false;
+
+            mode = MODE_BEGIN; // default mode for both structures
+            UpdateTimeComplexityForMode(mode);
+
+            if (gStructure == STRUCT_LIST) {
+                statusMsg = "Switched to LIST";
+                SetOperationNote(
+                    "LINKED LIST",
+                    "Singly linked list with dynamic nodes.\n"
+                    "Use insert/delete/search operations from the menu."
+                );
+            }
+            else {
+                statusMsg = "Switched to STACK";
+                SetOperationNote(
+                    "STACK",
+                    "Stack implemented using the same nodes.\n"
+                    "TOP pointer is at the first node (top of the stack).\n"
+                    "Use PUSH / POP / PEEK / SEARCH / CLEAR."
+                );
+            }
+            statusTimer = 2.0f;
+        }
+
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) &&
+            CheckCollisionPointRec(mouseScreen, stepToggleRect)) {
+            gStepMode = !gStepMode;
+            if (gStepMode) {
+                statusMsg = "Step mode ON. Press N to advance.";
+                SetOperationNote(
+                    "STEP MODE",
+                    "- When Step mode is ON:\n"
+                    "  Traversal uses manual steps instead of a timer.\n"
+                    "- Press 'N' to move to the next node.\n"
+                    "- Useful to see how pointers move."
+                );
+            }
+            else {
+                statusMsg = "Step mode OFF. Traversal uses auto animation.";
+            }
+            statusTimer = 2.5f;
+            gTraversal.stepTimer = 0.0f;
+            gBubble.stepTimer = 0.0f;
+        }
+
+        // =====================
+        // Operations menu (center dropdown)
+        // =====================
+        if (gTopMenuExpanded) {
+            if (gStructure == STRUCT_LIST) {
+                const char* labels[] = {
+                    "Insert at BEGINNING",
+                    "Insert at END",
+                    "Insert AFTER VALUE",
+                    "SET node VALUE",
+                    "Delete by VALUE",
+                    "Delete from BEGINNING",
+                    "Delete from END",
+                    "SEARCH VALUE",
+                    "REVERSE LIST",
+                    "MIN / MAX highlight",
+                    "BUBBLE SORT (INT)",
+                    "CLEAR LIST"
+                };
+                Mode modesArr[] = {
+                    MODE_BEGIN, MODE_END, MODE_POS, MODE_SET, MODE_DEL_VAL,
+                    MODE_DEL_BEGIN, MODE_DEL_END, MODE_SEARCH, MODE_REVERSE,
+                    MODE_MINMAX, MODE_BUBBLE_SORT, MODE_CLEAR
+                };
+                int count = 12;
+
+                float itemFont = 18.0f;
+                float itemHeight = 34.0f;
+                float gapTop = 4.0f;
+
+                float maxLabelWidth = 0.0f;
+                for (int i = 0; i < count; ++i) {
+                    Vector2 sz = MeasureTextEx(font, labels[i], itemFont, 1.0f);
+                    if (sz.x > maxLabelWidth) maxLabelWidth = sz.x;
+                }
+
+                float paddingX = 22.0f;
+                float marginX = 14.0f;
+                float itemWidth = maxLabelWidth + paddingX * 2.0f;
+                float dropdownWidth = itemWidth + marginX * 2.0f;
+                float dropdownHeight = count * (itemHeight + gapTop) + 16.0f;
+
+                float dropdownX = (float)GetScreenWidth() / 2.0f - dropdownWidth / 2.0f;
+                float dropdownY = 220.0f;
+
+                Rectangle dropdownShadow = { dropdownX + 3, dropdownY + 4, dropdownWidth, dropdownHeight };
+                DrawRectangleRounded(dropdownShadow, 0.28f, 14, Color{ 0, 0, 0, 45 });
+
+                Color panelFill2 = (gTheme == THEME_LIGHT) ? Color{ 240, 243, 255, 255 } : Color{ 35, 40, 70, 255 };
+                Color panelBorder2 = (gTheme == THEME_LIGHT) ? Color{ 210, 215, 235, 255 } : Color{ 115, 120, 175, 255 };
+
+                Rectangle dropdownPanel = { dropdownX, dropdownY, dropdownWidth, dropdownHeight };
+                DrawRectangleRounded(dropdownPanel, 0.28f, 14, panelFill2);
+                DrawRectangleRoundedLines(dropdownPanel, 0.28f, 14, panelBorder2);
+
+                float y = dropdownY + 8.0f;
+                for (int i = 0; i < count; ++i) {
+                    Vector2 itemTextSize = MeasureTextEx(font, labels[i], itemFont, 1.0f);
+                    Rectangle itemRect = { dropdownX + marginX, y, itemWidth, itemHeight };
+                    bool hover = CheckCollisionPointRec(mouseScreen, itemRect);
+                    bool active = (mode == modesArr[i]);
+
+                    Color fillItem;
+                    Color borderItem;
+                    Color textColorItem;
+
+                    if (active) {
+                        fillItem = Color{ 145, 105, 255, 255 };
+                        borderItem = Color{ 115, 80, 225, 255 };
+                        textColorItem = Color{ 255, 255, 255, 255 };
+                    }
+                    else if (hover) {
+                        fillItem = (gTheme == THEME_LIGHT) ? Color{ 226, 232, 255, 255 } : Color{ 60, 65, 100, 255 };
+                        borderItem = (gTheme == THEME_LIGHT) ? Color{ 190, 200, 245, 255 } : Color{ 135, 140, 190, 255 };
+                        textColorItem = (gTheme == THEME_LIGHT) ? Color{ 55, 65, 105, 255 } : Color{ 230, 235, 255, 255 };
+                    }
+                    else {
+                        fillItem = (gTheme == THEME_LIGHT) ? Color{ 249, 251, 255, 255 } : Color{ 46, 52, 86, 255 };
+                        borderItem = (gTheme == THEME_LIGHT) ? Color{ 215, 220, 240, 255 } : Color{ 115, 120, 175, 255 };
+                        textColorItem = (gTheme == THEME_LIGHT) ? Color{ 60, 70, 100, 255 } : Color{ 220, 225, 250, 255 };
+                    }
+
+                    DrawRectangleRounded(itemRect, 0.55f, 10, fillItem);
+                    DrawRectangleRoundedLines(itemRect, 0.55f, 10, borderItem);
+
+                    DrawTextEx(font, labels[i],
+                        Vector2{ itemRect.x + (itemRect.width - itemTextSize.x) / 2.0f,
+                                 itemRect.y + (itemRect.height - itemTextSize.y) / 2.0f },
+                        itemFont, 1, textColorItem);
+
+                    if (hover && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                        mode = modesArr[i];
+                        gTopMenuExpanded = false;
+                    }
+                    y += itemHeight + gapTop;
+                }
+            }
+            else {
+                // STACK menu
+                const char* labels[] = {
+                    "PUSH (add to TOP)",
+                    "POP (remove TOP)",
+                    "PEEK (show TOP)",
+                    "SEARCH",
+                    "CLEAR STACK"
+                };
+                Mode modesArr[] = {
+                    MODE_BEGIN,        // PUSH
+                    MODE_DEL_BEGIN,    // POP
+                    MODE_STACK_PEEK,   // PEEK
+                    MODE_SEARCH,       // SEARCH
+                    MODE_CLEAR         // CLEAR STACK
+                };
+                int count = 5;
+
+                float itemFont = 18.0f;
+                float itemHeight = 34.0f;
+                float gapTop = 4.0f;
+
+                float maxLabelWidth = 0.0f;
+                for (int i = 0; i < count; ++i) {
+                    Vector2 sz = MeasureTextEx(font, labels[i], itemFont, 1.0f);
+                    if (sz.x > maxLabelWidth) maxLabelWidth = sz.x;
+                }
+
+                float paddingX = 22.0f;
+                float marginX = 14.0f;
+                float itemWidth = maxLabelWidth + paddingX * 2.0f;
+                float dropdownWidth = itemWidth + marginX * 2.0f;
+                float dropdownHeight = count * (itemHeight + gapTop) + 16.0f;
+
+                float dropdownX = (float)GetScreenWidth() / 2.0f - dropdownWidth / 2.0f;
+                float dropdownY = 220.0f;
+
+                Rectangle dropdownShadow = { dropdownX + 3, dropdownY + 4, dropdownWidth, dropdownHeight };
+                DrawRectangleRounded(dropdownShadow, 0.28f, 14, Color{ 0, 0, 0, 45 });
+
+                Color panelFill2 = (gTheme == THEME_LIGHT) ? Color{ 240, 243, 255, 255 } : Color{ 35, 40, 70, 255 };
+                Color panelBorder2 = (gTheme == THEME_LIGHT) ? Color{ 210, 215, 235, 255 } : Color{ 115, 120, 175, 255 };
+
+                Rectangle dropdownPanel = { dropdownX, dropdownY, dropdownWidth, dropdownHeight };
+                DrawRectangleRounded(dropdownPanel, 0.28f, 14, panelFill2);
+                DrawRectangleRoundedLines(dropdownPanel, 0.28f, 14, panelBorder2);
+
+                float y = dropdownY + 8.0f;
+                for (int i = 0; i < count; ++i) {
+                    Vector2 itemTextSize = MeasureTextEx(font, labels[i], itemFont, 1.0f);
+                    Rectangle itemRect = { dropdownX + marginX, y, itemWidth, itemHeight };
+                    bool hover = CheckCollisionPointRec(mouseScreen, itemRect);
+                    bool active = (mode == modesArr[i]);
+
+                    Color fillItem;
+                    Color borderItem;
+                    Color textColorItem;
+
+                    if (active) {
+                        fillItem = Color{ 145, 105, 255, 255 };
+                        borderItem = Color{ 115, 80, 225, 255 };
+                        textColorItem = Color{ 255, 255, 255, 255 };
+                    }
+                    else if (hover) {
+                        fillItem = (gTheme == THEME_LIGHT) ? Color{ 226, 232, 255, 255 } : Color{ 60, 65, 100, 255 };
+                        borderItem = (gTheme == THEME_LIGHT) ? Color{ 190, 200, 245, 255 } : Color{ 135, 140, 190, 255 };
+                        textColorItem = (gTheme == THEME_LIGHT) ? Color{ 55, 65, 105, 255 } : Color{ 230, 235, 255, 255 };
+                    }
+                    else {
+                        fillItem = (gTheme == THEME_LIGHT) ? Color{ 249, 251, 255, 255 } : Color{ 46, 52, 86, 255 };
+                        borderItem = (gTheme == THEME_LIGHT) ? Color{ 215, 220, 240, 255 } : Color{ 115, 120, 175, 255 };
+                        textColorItem = (gTheme == THEME_LIGHT) ? Color{ 60, 70, 100, 255 } : Color{ 220, 225, 250, 255 };
+                    }
+
+                    DrawRectangleRounded(itemRect, 0.55f, 10, fillItem);
+                    DrawRectangleRoundedLines(itemRect, 0.55f, 10, borderItem);
+
+                    DrawTextEx(font, labels[i],
+                        Vector2{ itemRect.x + (itemRect.width - itemTextSize.x) / 2.0f,
+                                 itemRect.y + (itemRect.height - itemTextSize.y) / 2.0f },
+                        itemFont, 1, textColorItem);
+
+                    if (hover && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                        mode = modesArr[i];
+                        gTopMenuExpanded = false;
+                    }
+                    y += itemHeight + gapTop;
+                }
+            }
+        }
+
+        // =====================
+        // Mode changed: apply operations that are triggered by selecting mode
+        // =====================
+        if (mode != oldMode) {
+            // كل ما نغيّر المود نوقف الـ traversal و الـ bubble
+            gTraversal.active = false;
+            gTraversal.current = nullptr;
+            gTraversal.previous = nullptr;
+            gBubble.active = false;
+            gBubble.stepTimer = 0.0f;
+
+            UpdateTimeComplexityForMode(mode);
+
+            if (gStructure == STRUCT_STACK) {
+                // Stack operations: POP / PEEK / CLEAR
+                if (mode == MODE_DEL_BEGIN) { // POP
+                    if (!head) {
+                        statusMsg = "Cannot POP - stack is empty";
+                    }
+                    else {
+                        string val = head->value;
+                        DeleteFromBeginningVisual(head);
+                        ClearHighlights();
+                        statusMsg = "POP from TOP: " + val;
+                        SetOperationNote(
+                            "STACK POP",
+                            "if (top != nullptr) {\n"
+                            "    Node* temp = top;\n"
+                            "    top = top->next;\n"
+                            "    delete temp;\n"
+                            "}"
+                        );
+                    }
+                    statusTimer = 2.5f;
+                }
+                else if (mode == MODE_STACK_PEEK) {
+                    if (!head) {
+                        statusMsg = "Cannot PEEK - stack is empty";
+                        SetOperationNote(
+                            "STACK PEEK",
+                            "top == nullptr => empty stack."
+                        );
+                    }
+                    else {
+                        gSearchValue = head->value;
+                        gHasSearchHighlight = true;
+                        gHasMinMaxHighlight = false;
+                        statusMsg = "TOP = " + head->value;
+                        SetOperationNote(
+                            "STACK PEEK",
+                            "if (top != nullptr)\n"
+                            "    return top->value;"
+                        );
+                    }
+                    statusTimer = 2.5f;
+                }
+                else if (mode == MODE_CLEAR) {
+                    if (!head) statusMsg = "Stack is already empty";
+                    else {
+                        ClearList(head);
+                        statusMsg = "Stack cleared";
+                    }
+                    statusTimer = 2.5f;
+                    awaitingSecondInput = false;
+                    inputValue.clear();
+                    SetOperationNote(
+                        "CLEAR STACK",
+                        "while (top != nullptr) {\n"
+                        "    Node* temp = top;\n"
+                        "    top = top->next;\n"
+                        "    delete temp;\n"
+                        "}"
+                    );
+                }
+            }
+            else {
+                // List operations triggered by mode change
+                if (mode == MODE_DEL_BEGIN) {
+                    if (!head) {
+                        statusMsg = "Cannot delete from beginning - list is empty";
+                    }
+                    else {
+                        DeleteFromBeginningVisual(head);
+                        ClearHighlights();
+                        statusMsg = "Deleted first node";
+                        SetOperationNote(
+                            "Delete from BEGINNING",
+                            "if (head != nullptr) {\n"
+                            "    Node* temp = head;\n"
+                            "    head = head->next;\n"
+                            "    delete temp;\n"
+                            "}"
+                        );
+                    }
+                    statusTimer = 2.5f;
+                }
+                else if (mode == MODE_DEL_END) {
+                    if (!head) {
+                        statusMsg = "Cannot delete from end - list is empty";
+                    }
+                    else {
+                        DeleteFromEndVisual(head);
+                        ClearHighlights();
+                        statusMsg = "Deleted last node";
+                        SetOperationNote(
+                            "Delete from END",
+                            "if (head == nullptr) return;\n"
+                            "if (head->next == nullptr) {\n"
+                            "    delete head;\n"
+                            "    head = nullptr;\n"
+                            "}\n"
+                            "else {\n"
+                            "    Node* prev = nullptr;\n"
+                            "    Node* cur  = head;\n"
+                            "    while (cur->next != nullptr) {\n"
+                            "        prev = cur;\n"
+                            "        cur  = cur->next;\n"
+                            "    }\n"
+                            "    prev->next = nullptr;\n"
+                            "    delete cur;\n"
+                            "}"
+                        );
+                    }
+                    statusTimer = 2.5f;
+                }
+                else if (mode == MODE_REVERSE) {
+                    if (!head) {
+                        statusMsg = "Cannot reverse - list is empty";
+                    }
+                    else if (!head->next) {
+                        statusMsg = "List has only one node - nothing changed";
+                    }
+                    else {
+                        ReverseListVisual(head);
+                        ClearHighlights();
+                        statusMsg = "List reversed";
+                        SetOperationNote(
+                            "REVERSE LIST",
+                            "Node* prev = nullptr;\n"
+                            "Node* cur  = head;\n"
+                            "while (cur != nullptr) {\n"
+                            "    Node* next = cur->next;\n"
+                            "    cur->next = prev;\n"
+                            "    prev = cur;\n"
+                            "    cur  = next;\n"
+                            "}\n"
+                            "head = prev;"
+                        );
+                    }
+                    statusTimer = 2.5f;
+                }
+                else if (mode == MODE_MINMAX) {
+                    if (!head) {
+                        statusMsg = "Cannot compute min/max - list is empty";
+                        gHasMinMaxHighlight = false;
+                    }
+                    else if (gValueType != VALUE_INT) {
+                        statusMsg = "Min/Max works only in INT mode";
+                        gHasMinMaxHighlight = false;
+                    }
+                    else {
+                        if (UpdateMinMaxHighlight(head)) {
+                            statusMsg = "Min = " + to_string(gMinValue) +
+                                ", Max = " + to_string(gMaxValue);
+                        }
+                        else {
+                            statusMsg = "No numeric values found";
+                        }
+                        SetOperationNote(
+                            "MIN / MAX highlight",
+                            "int mn = head->value;\n"
+                            "int mx = head->value;\n"
+                            "Node* p = head->next;\n"
+                            "while (p != nullptr) {\n"
+                            "    if (p->value < mn) mn = p->value;\n"
+                            "    if (p->value > mx) mx = p->value;\n"
+                            "    p = p->next;\n"
+                            "}\n"
+                            "Highlight nodes equal to mn or mx."
+                        );
+                    }
+                    statusTimer = 2.5f;
+                }
+                else if (mode == MODE_BUBBLE_SORT) {
+                    // === تهيئة حالة الـ Bubble Sort ===
+                    if (!head || !head->next) {
+                        statusMsg = "Cannot sort - list has 0 or 1 node";
+                        statusTimer = 2.5f;
+                    }
+                    else if (gValueType != VALUE_INT) {
+                        statusMsg = "Bubble sort works only in INT mode";
+                        statusTimer = 2.5f;
+                    }
+                    else {
+                        gBubble.active = true;
+                        gBubble.prev = nullptr;
+                        gBubble.curr = head;
+                        gBubble.lastSorted = nullptr;
+                        gBubble.swappedInPass = false;
+                        gBubble.stepTimer = 0.0f;
+
+                        ClearHighlights();
+                        statusMsg = "Bubble sort started (INT).";
+                        statusTimer = 2.5f;
+
+                        SetOperationNote(
+                            "BUBBLE SORT (INT)",
+                            "Bubble sort on a singly linked list:\n"
+                            " - Compare curr and next.\n"
+                            " - If curr > next => swap via pointers.\n"
+                            " - Repeat passes until list is sorted.\n"
+                            "\nIn visualizer:\n"
+                            " - CURRENT / PREVIOUS توضح حركة البوينتر.\n"
+                            " - إذا كان STEP: اضغط N عشان يتحرك."
+                        );
+                    }
+                }
+                else if (mode == MODE_CLEAR) {
+                    if (!head) statusMsg = "List is already empty";
+                    else {
+                        ClearList(head);
+                        statusMsg = "List cleared";
+                    }
+
+                    statusTimer = 2.5f;
+                    awaitingSecondInput = false;
+                    inputValue.clear();
+                    SetOperationNote(
+                        "CLEAR LIST",
+                        "while (head != nullptr) {\n"
+                        "    Node* temp = head;\n"
+                        "    head = head->next;\n"
+                        "    delete temp;\n"
+                        "}"
+                    );
+                }
+            }
+        }
+
+        // Input box
+        DrawCenteredInputBox(font, inputValue, 150.0f, mode, awaitingSecondInput);
+
+        // Draw nodes + arrows (world space)
+        BeginMode2D(cam);
+        if (head != nullptr) {
+            // arrows between nodes
+            for (VNode* p = head; p != nullptr && p->next != nullptr; p = p->next) {
+                if (gStructure == STRUCT_STACK) {
+                    float h = 64.0f;
+                    Vector2 a = { p->pos.x, p->pos.y + h / 2.0f };
+                    Vector2 b = { p->next->pos.x, p->next->pos.y - h / 2.0f };
+                    DrawArrowShape(a, b, 3.0f, 16.0f, Color{ 80, 80, 110, 210 });
+                }
+                else {
+                    float w1 = GetNodeWidth(p, font);
+                    float w2 = GetNodeWidth(p->next, font);
+                    Vector2 a = p->pos; a.x += w1 / 2.0f;
+                    Vector2 b = p->next->pos; b.x -= w2 / 2.0f;
+                    DrawArrowShape(a, b, 3.0f, 16.0f, Color{ 80, 80, 110, 210 });
+                }
+            }
+            // nodes
+            for (VNode* p = head; p != nullptr; p = p->next) {
+                DrawNodeBox(font, p);
+            }
+            // NULL at end for list
+            VNode* last = head;
+            while (last->next != nullptr) last = last->next;
+
+            if (gStructure == STRUCT_LIST) {
+                float lastWidth = GetNodeWidth(last, font);
+                Color nullColor = (gTheme == THEME_LIGHT) ? Color{ 60, 70, 90, 200 } : Color{ 220, 225, 245, 220 };
+                DrawTextEx(font, "NULL",
+                    Vector2{ last->pos.x + lastWidth / 2.0f + 10.0f, last->pos.y - 16.0f },
+                    26, 1, nullColor);
+            }
+        }
+        else {
+            // When structure is empty
+            Color emptyColor = (gTheme == THEME_LIGHT) ? Color{ 0, 0, 0, 90 } : Color{ 230, 235, 255, 130 };
+            DrawTextEx(font, "Structure is empty. Use the center menu, enter a value, then press ENTER.",
+                Vector2{ -320.0f, listY - 10.0f }, 24, 1, emptyColor);
+        }
+        EndMode2D();
+
+        // HEAD/TOP label and CURRENT/PREVIOUS arrows in screen space
+        if (head != nullptr) {
+            Vector2 headScreen = GetWorldToScreen2D(head->pos, cam);
+            const char* headText = (gStructure == STRUCT_LIST ? "HEAD" : "TOP");
+            float headFont = 28.0f;
+            Vector2 headLabelSize = MeasureTextEx(font, headText, headFont, 1);
+            float minX = 430.0f;
+            Vector2 headPos = { headScreen.x - headLabelSize.x / 2.0f,
+                                headScreen.y - 130.0f };
+            if (headPos.x < minX) headPos.x = minX;
+            Color headColor = (gTheme == THEME_LIGHT) ? Color{ 40, 50, 70, 240 } : Color{ 230, 235, 255, 240 };
+            DrawTextEx(font, headText, headPos, headFont, 1, headColor);
+            DrawHeadArrowNice(headPos, headLabelSize, headScreen);
+
+            if (gTraversal.active && gTraversal.current) {
+                Vector2 curScreen = GetWorldToScreen2D(gTraversal.current->pos, cam);
+                Color curOuter = (gTheme == THEME_LIGHT) ? Color{ 20, 140, 160, 255 } : Color{ 120, 220, 240, 255 };
+                Color curInner = Color{ 255, 255, 255, 230 };
+                DrawPointerArrowLabel(font, "CURRENT", curScreen, 80.0f, 110.0f, curOuter, curInner);
+            }
+            if (gTraversal.active && gTraversal.previous) {
+                Vector2 prevScreen = GetWorldToScreen2D(gTraversal.previous->pos, cam);
+                Color prevOuter = (gTheme == THEME_LIGHT) ? Color{ 200, 120, 80, 255 } : Color{ 255, 190, 120, 255 };
+                Color prevInner = Color{ 255, 255, 255, 230 };
+                DrawPointerArrowLabel(font, "PREVIOUS", prevScreen, -80.0f, 110.0f, prevOuter, prevInner);
+            }
+        }
+
+        // Draw status message
+        if (statusTimer > 0.0f) {
+            ShowStatus(font, statusMsg);
+            statusTimer -= dt;
+        }
+
+        EndDrawing();
+    }
+
+    // Cleanup
+    ClearList(head);
+    if (customFontLoaded) UnloadFont(font);
+    CloseWindow();
+    return 0;
+}
