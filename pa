@@ -1,0 +1,103 @@
+#include <iostream>
+#include <vector>
+#include <stack>
+#include <queue>
+#include <unordered_map>
+
+using namespace std;
+
+struct Patient {
+    int id;
+    string name;
+    int age;
+};
+
+struct Node {
+    Patient data;
+    Node* next;
+};
+
+Node* head = nullptr;
+
+void addPatient(Patient p) {
+    head = new Node{p, head};
+}
+
+bool searchPatient(int id) {
+    Node* temp = head;
+    while (temp) {
+        if (temp->data.id == id)
+            return true;
+        temp = temp->next;
+    }
+    return false;
+}
+
+struct Doctor {
+    int id;
+    string name;
+};
+
+struct DoctorNode {
+    Doctor data;
+    DoctorNode* left;
+    DoctorNode* right;
+};
+
+DoctorNode* insertDoctor(DoctorNode* root, Doctor d) {
+    if (!root)
+        return new DoctorNode{d, nullptr, nullptr};
+
+    if (d.id < root->data.id)
+        root->left = insertDoctor(root->left, d);
+    else
+        root->right = insertDoctor(root->right, d);
+
+    return root;
+}
+
+int main() {
+
+    Patient p1{1, "Ali", 25};
+    Patient p2{2, "Sara", 30};
+    Patient p3{3, "Omar", 20};
+
+    addPatient(p1);
+    addPatient(p2);
+    addPatient(p3);
+
+    queue<Patient> waitingQueue;
+    waitingQueue.push(p1);
+    waitingQueue.push(p2);
+    waitingQueue.push(p3);
+
+    stack<string> actions;
+    actions.push("Add Ali");
+    actions.push("Add Sara");
+    actions.push("Add Omar");
+
+    unordered_map<int, Patient> patientMap;
+    patientMap[p1.id] = p1;
+    patientMap[p2.id] = p2;
+    patientMap[p3.id] = p3;
+
+    cout << "Search Patient ID 2: ";
+    if (searchPatient(2))
+        cout << "Found\n";
+    else
+        cout << "Not Found\n";
+
+    DoctorNode* root = nullptr;
+    root = insertDoctor(root, {10, "Dr. Ahmad"});
+    root = insertDoctor(root, {5, "Dr. Lina"});
+    root = insertDoctor(root, {15, "Dr. Sami"});
+
+    vector<vector<int>> graph(4);
+    graph[0].push_back(1);
+    graph[1].push_back(2);
+    graph[2].push_back(3);
+
+    cout << "Hospital Data Structures Demo Completed Successfully\n";
+
+    return 0;
+}
